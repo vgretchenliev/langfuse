@@ -555,6 +555,16 @@ export type JobExecution = {
   job_output_score_id: string | null;
   execution_trace_id: string | null;
 };
+export type KubitIntegration = {
+  project_id: string;
+  endpoint_url: string;
+  encrypted_api_key: string;
+  enabled: boolean;
+  sync_interval_minutes: Generated<number>;
+  session_offset_minutes: Generated<number>;
+  last_sync_at: Timestamp | null;
+  created_at: Generated<Timestamp>;
+};
 export type LegacyPrismaObservation = {
   id: string;
   trace_id: string | null;
@@ -976,6 +986,7 @@ export type DB = {
   eval_templates: EvalTemplate;
   job_configurations: JobConfiguration;
   job_executions: JobExecution;
+  kubit_integrations: KubitIntegration;
   llm_api_keys: LlmApiKeys;
   llm_schemas: LlmSchema;
   llm_tools: LlmTool;

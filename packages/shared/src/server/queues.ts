@@ -114,6 +114,9 @@ export const MixpanelIntegrationProcessingEventSchema = z.object({
 export const BlobStorageIntegrationProcessingEventSchema = z.object({
   projectId: z.string(),
 });
+export const KubitIntegrationProcessingEventSchema = z.object({
+  projectId: z.string(),
+});
 export const ExperimentCreateEventSchema = z.object({
   projectId: z.string(),
   datasetId: z.string(),
@@ -293,6 +296,9 @@ export type BatchActionProcessingEventType = z.infer<
 export type BlobStorageIntegrationProcessingEventType = z.infer<
   typeof BlobStorageIntegrationProcessingEventSchema
 >;
+export type KubitIntegrationProcessingEventType = z.infer<
+  typeof KubitIntegrationProcessingEventSchema
+>;
 export type DeadLetterRetryQueueEventType = z.infer<
   typeof DeadLetterRetryQueueEventSchema
 >;
@@ -339,6 +345,8 @@ export enum QueueName {
   EntityChangeQueue = "entity-change-queue",
   EventPropagationQueue = "event-propagation-queue",
   NotificationQueue = "notification-queue",
+  KubitIntegrationQueue = "kubit-integration-queue",
+  KubitIntegrationProcessingQueue = "kubit-integration-processing-queue",
 }
 
 export enum QueueJobs {
@@ -375,6 +383,8 @@ export enum QueueJobs {
   EntityChangeJob = "entity-change-job",
   EventPropagationJob = "event-propagation-job",
   NotificationJob = "notification-job",
+  KubitIntegrationJob = "kubit-integration-job",
+  KubitIntegrationProcessingJob = "kubit-integration-processing-job",
 }
 
 export type TQueueJobTypes = {
@@ -471,6 +481,12 @@ export type TQueueJobTypes = {
     id: string;
     payload: MixpanelIntegrationProcessingEventType;
     name: QueueJobs.MixpanelIntegrationProcessingJob;
+  };
+  [QueueName.KubitIntegrationProcessingQueue]: {
+    timestamp: Date;
+    id: string;
+    payload: KubitIntegrationProcessingEventType;
+    name: QueueJobs.KubitIntegrationProcessingJob;
   };
   [QueueName.DataRetentionProcessingQueue]: {
     timestamp: Date;
