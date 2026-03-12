@@ -200,7 +200,7 @@ export const getProjectSettingsPages = ({
   {
     title: "Integrations",
     slug: "integrations",
-    cmdKKeywords: ["posthog", "mixpanel", "analytics"],
+    cmdKKeywords: ["posthog", "mixpanel", "kubit", "analytics"],
     content: <Integrations projectId={project.id} />,
   },
   {
@@ -323,6 +323,23 @@ const Integrations = (props: { projectId: string }) => {
                 Integration Docs ↗
               </Link>
             </Button>
+          </div>
+        </Card>
+
+        <Card className="p-3">
+          <span className="mb-4 block font-semibold">Kubit</span>
+          <p className="mb-4 text-sm text-primary">
+            Integrate with Kubit to sync your Langfuse traces, observations, and
+            scores for advanced product analytics.
+          </p>
+          <div className="flex items-center gap-2">
+            <ActionButton
+              variant="secondary"
+              hasAccess={hasAccess}
+              href={`/project/${props.projectId}/settings/integrations/kubit`}
+            >
+              Configure
+            </ActionButton>
           </div>
         </Card>
 
