@@ -106,6 +106,7 @@ const KubitIntegrationSettingsForm = ({
     enabled: boolean;
     syncIntervalMinutes: number;
     sessionOffsetMinutes: number;
+    requestTimeoutSeconds: number;
     lastSyncAt?: Date | null;
   } | null;
   projectId: string;
@@ -119,6 +120,7 @@ const KubitIntegrationSettingsForm = ({
       enabled: state?.enabled ?? false,
       syncIntervalMinutes: state?.syncIntervalMinutes ?? 60,
       sessionOffsetMinutes: state?.sessionOffsetMinutes ?? 30,
+      requestTimeoutSeconds: state?.requestTimeoutSeconds ?? 30,
     },
     disabled: isLoading,
   });
@@ -130,6 +132,7 @@ const KubitIntegrationSettingsForm = ({
       enabled: state?.enabled ?? false,
       syncIntervalMinutes: state?.syncIntervalMinutes ?? 60,
       sessionOffsetMinutes: state?.sessionOffsetMinutes ?? 30,
+      requestTimeoutSeconds: state?.requestTimeoutSeconds ?? 30,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
@@ -232,6 +235,29 @@ const KubitIntegrationSettingsForm = ({
               <FormDescription>
                 How far behind now to sync — increase if sessions last longer
                 than 30 minutes (min: 5, max: 120)
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <FormField
+          control={kubitForm.control}
+          name="requestTimeoutSeconds"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Request Timeout (seconds)</FormLabel>
+              <FormControl>
+                <Input
+                  {...field}
+                  type="number"
+                  min={5}
+                  max={300}
+                  onChange={(e) => field.onChange(parseInt(e.target.value, 10))}
+                />
+              </FormControl>
+              <FormDescription>
+                How long to wait for a response from Kubit before retrying (min:
+                5, max: 300)
               </FormDescription>
               <FormMessage />
             </FormItem>

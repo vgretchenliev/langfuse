@@ -18,6 +18,7 @@ type KubitConfig = {
   minTimestamp: Date;
   maxTimestamp: Date;
   endpointUrl: string;
+  requestTimeoutSeconds: number;
 };
 
 const processKubitTraces = async (config: KubitConfig) => {
@@ -30,6 +31,7 @@ const processKubitTraces = async (config: KubitConfig) => {
   const client = new KubitClient({
     endpointUrl: config.endpointUrl,
     apiKey: config.apiKey,
+    requestTimeoutSeconds: config.requestTimeoutSeconds,
   });
   let count = 0;
 
@@ -58,6 +60,7 @@ const processKubitObservations = async (config: KubitConfig) => {
   const client = new KubitClient({
     endpointUrl: config.endpointUrl,
     apiKey: config.apiKey,
+    requestTimeoutSeconds: config.requestTimeoutSeconds,
   });
   let count = 0;
 
@@ -88,6 +91,7 @@ const processKubitScores = async (config: KubitConfig) => {
   const client = new KubitClient({
     endpointUrl: config.endpointUrl,
     apiKey: config.apiKey,
+    requestTimeoutSeconds: config.requestTimeoutSeconds,
   });
   let count = 0;
 
@@ -138,6 +142,7 @@ export const handleKubitProjectJob = async (
       new Date().getTime() - dbIntegration.sessionOffsetMinutes * 60 * 1000,
     ),
     endpointUrl: dbIntegration.endpointUrl,
+    requestTimeoutSeconds: dbIntegration.requestTimeoutSeconds,
   };
 
   try {
