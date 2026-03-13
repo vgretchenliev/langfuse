@@ -33,6 +33,7 @@ export const kubitIntegrationRouter = createTRPCRouter({
           enabled: dbConfig.enabled,
           syncIntervalMinutes: dbConfig.syncIntervalMinutes,
           sessionOffsetMinutes: dbConfig.sessionOffsetMinutes,
+          requestTimeoutSeconds: dbConfig.requestTimeoutSeconds,
           lastSyncAt: dbConfig.lastSyncAt,
           createdAt: dbConfig.createdAt,
         };
@@ -90,6 +91,7 @@ export const kubitIntegrationRouter = createTRPCRouter({
         enabled: input.enabled,
         syncIntervalMinutes: input.syncIntervalMinutes,
         sessionOffsetMinutes: input.sessionOffsetMinutes,
+        requestTimeoutSeconds: input.requestTimeoutSeconds,
         // Only update the API key if a new one is provided
         ...(input.apiKey ? { encryptedApiKey: encrypt(input.apiKey) } : {}),
       };

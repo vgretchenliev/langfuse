@@ -1092,15 +1092,16 @@ model MixpanelIntegration {
 }
 
 model KubitIntegration {
-  projectId            String    @id @map("project_id")
-  project              Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  endpointUrl          String    @map("endpoint_url")
-  encryptedApiKey      String    @map("encrypted_api_key")
-  enabled              Boolean
-  syncIntervalMinutes  Int       @default(60) @map("sync_interval_minutes")
-  sessionOffsetMinutes Int       @default(30) @map("session_offset_minutes")
-  lastSyncAt           DateTime? @map("last_sync_at")
-  createdAt            DateTime  @default(now()) @map("created_at")
+  projectId             String    @id @map("project_id")
+  project               Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  endpointUrl           String    @map("endpoint_url")
+  encryptedApiKey       String    @map("encrypted_api_key")
+  enabled               Boolean
+  syncIntervalMinutes   Int       @default(60) @map("sync_interval_minutes")
+  sessionOffsetMinutes  Int       @default(30) @map("session_offset_minutes")
+  requestTimeoutSeconds Int       @default(30) @map("request_timeout_seconds")
+  lastSyncAt            DateTime? @map("last_sync_at")
+  createdAt             DateTime  @default(now()) @map("created_at")
 
   @@map("kubit_integrations")
 }

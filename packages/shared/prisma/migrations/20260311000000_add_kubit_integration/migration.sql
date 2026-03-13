@@ -6,6 +6,7 @@ CREATE TABLE "kubit_integrations" (
     "enabled" BOOLEAN NOT NULL,
     "sync_interval_minutes" INTEGER NOT NULL DEFAULT 60,
     "session_offset_minutes" INTEGER NOT NULL DEFAULT 30,
+    "request_timeout_seconds" INTEGER NOT NULL DEFAULT 30,
     "last_sync_at" TIMESTAMP(3),
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 

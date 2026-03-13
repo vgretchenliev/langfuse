@@ -11,6 +11,7 @@ import { useQueryProject } from "@/src/features/projects/hooks";
 import { MembershipInvitesPage } from "@/src/features/rbac/components/MembershipInvitesPage";
 import { MembersTable } from "@/src/features/rbac/components/MembersTable";
 import { JSONView } from "@/src/components/ui/CodeJsonViewer";
+import Image from "next/image";
 import { PostHogLogo } from "@/src/components/PosthogLogo";
 import { MixpanelLogo } from "@/src/components/MixpanelLogo";
 import { Card } from "@/src/components/ui/card";
@@ -327,7 +328,13 @@ const Integrations = (props: { projectId: string }) => {
         </Card>
 
         <Card className="p-3">
-          <span className="mb-4 block font-semibold">Kubit</span>
+          <Image
+            src="/kubit-logo.png"
+            alt="Kubit"
+            width={80}
+            height={24}
+            className="mb-4"
+          />
           <p className="mb-4 text-sm text-primary">
             Integrate with Kubit to sync your Langfuse traces, observations, and
             scores for advanced product analytics.

@@ -563,6 +563,7 @@ export type KubitIntegration = {
   enabled: boolean;
   sync_interval_minutes: Generated<number>;
   session_offset_minutes: Generated<number>;
+  request_timeout_seconds: Generated<number>;
   last_sync_at: Timestamp | null;
   created_at: Generated<Timestamp>;
 };
