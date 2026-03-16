@@ -3,13 +3,13 @@ import { logger } from "@langfuse/shared/src/server";
 type KubitEvent = Record<string, unknown> & { entity_type: string };
 
 const MAX_RETRIES = 3;
+const MAX_BATCH_BYTES = 8 * 1024 * 1024; // 8 MB — 2 MB safety margin below API Gateway's 10 MB hard limit
 
 export class KubitClient {
   private readonly endpointUrl: string;
   private readonly apiKey: string;
   private readonly requestTimeoutMs: number;
   private batch: KubitEvent[] = [];
-  private readonly batchSize = 1000;
 
   constructor({
     endpointUrl,
@@ -35,8 +35,25 @@ export class KubitClient {
     }
 
     const chunks: KubitEvent[][] = [];
-    for (let i = 0; i < this.batch.length; i += this.batchSize) {
-      chunks.push(this.batch.slice(i, i + this.batchSize));
+    let currentChunk: KubitEvent[] = [];
+    let currentChunkBytes = 0;
+
+    for (const event of this.batch) {
+      const eventBytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+      if (
+        currentChunk.length > 0 &&
+        currentChunkBytes + eventBytes > MAX_BATCH_BYTES
+      ) {
+        chunks.push(currentChunk);
+        currentChunk = [];
+        currentChunkBytes = 0;
+      }
+      currentChunk.push(event);
+      currentChunkBytes += eventBytes;
+    }
+
+    if (currentChunk.length > 0) {
+      chunks.push(currentChunk);
     }
 
     for (const chunk of chunks) {
