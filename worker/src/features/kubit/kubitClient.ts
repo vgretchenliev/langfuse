@@ -188,7 +188,6 @@ export class KubitClient {
     //   • ≤ 1 MB per individual record (Kinesis hard limit)
     // Each Kinesis record carries exactly one enriched event as a
     // base64-encoded JSON string, keeping the format compatible with
-    // Firehose concatenation → NDJSON → Snowpipe ingestion.
     const calls: KubitEvent[][] = [];
     let currentCall: KubitEvent[] = [];
     let currentCallBytes = 0;
