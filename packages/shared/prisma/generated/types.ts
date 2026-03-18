@@ -561,9 +561,16 @@ export type KubitIntegration = {
   encrypted_api_key: string;
   enabled: boolean;
   sync_interval_minutes: Generated<number>;
-  session_offset_minutes: Generated<number>;
   request_timeout_seconds: Generated<number>;
+  encrypted_aws_access_key_id: string | null;
+  encrypted_aws_secret_access_key: string | null;
+  encrypted_aws_session_token: string | null;
+  aws_credentials_expiry: Timestamp | null;
+  aws_kinesis_stream_name: string | null;
+  aws_kinesis_region: string | null;
+  aws_kinesis_partition_key: string | null;
   last_sync_at: Timestamp | null;
+  last_error: string | null;
   created_at: Generated<Timestamp>;
 };
 export type LegacyPrismaObservation = {

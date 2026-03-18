@@ -5,6 +5,5 @@ export const kubitIntegrationFormSchema = z.object({
   apiKey: z.string(),
   enabled: z.boolean(),
   syncIntervalMinutes: z.number().int().min(15).max(1440),
-  sessionOffsetMinutes: z.number().int().min(5).max(120),
   requestTimeoutSeconds: z.number().int().min(5).max(300),
 });

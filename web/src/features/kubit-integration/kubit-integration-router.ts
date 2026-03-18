@@ -32,9 +32,9 @@ export const kubitIntegrationRouter = createTRPCRouter({
           endpointUrl: dbConfig.endpointUrl,
           enabled: dbConfig.enabled,
           syncIntervalMinutes: dbConfig.syncIntervalMinutes,
-          sessionOffsetMinutes: dbConfig.sessionOffsetMinutes,
           requestTimeoutSeconds: dbConfig.requestTimeoutSeconds,
           lastSyncAt: dbConfig.lastSyncAt,
+          lastError: dbConfig.lastError,
           createdAt: dbConfig.createdAt,
         };
       } catch (e) {
@@ -90,10 +90,11 @@ export const kubitIntegrationRouter = createTRPCRouter({
         endpointUrl: input.endpointUrl,
         enabled: input.enabled,
         syncIntervalMinutes: input.syncIntervalMinutes,
-        sessionOffsetMinutes: input.sessionOffsetMinutes,
         requestTimeoutSeconds: input.requestTimeoutSeconds,
         // Only update the API key if a new one is provided
         ...(input.apiKey ? { encryptedApiKey: encrypt(input.apiKey) } : {}),
+        // Clear any previous auth error — user may have fixed the API key
+        lastError: null,
       };
 
       if (existing) {

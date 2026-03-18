@@ -1,7 +1,9 @@
 import Header from "@/src/components/layouts/header";
 import ContainerPage from "@/src/components/layouts/container-page";
 import { StatusBadge } from "@/src/components/layouts/status-badge";
+import { Alert, AlertDescription } from "@/src/components/ui/alert";
 import { Button } from "@/src/components/ui/button";
+import { AlertTriangle } from "lucide-react";
 import {
   Form,
   FormControl,
@@ -69,6 +71,23 @@ export default function KubitIntegrationSettings() {
           reach out to your project admin or owner.
         </p>
       )}
+      {hasAccess && state.data?.lastError && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <p className="font-semibold">
+              Integration disabled — authentication failed
+            </p>
+            <p className="mt-1 text-sm">
+              The API key was rejected by the Kubit token endpoint. Update the
+              API key below and re-enable the integration.
+            </p>
+            <p className="mt-1 font-mono text-xs opacity-75">
+              {state.data.lastError}
+            </p>
+          </AlertDescription>
+        </Alert>
+      )}
       {hasAccess && (
         <>
           <Header title="Configuration" />
@@ -105,9 +124,9 @@ const KubitIntegrationSettingsForm = ({
     endpointUrl: string;
     enabled: boolean;
     syncIntervalMinutes: number;
-    sessionOffsetMinutes: number;
     requestTimeoutSeconds: number;
     lastSyncAt?: Date | null;
+    lastError?: string | null;
   } | null;
   projectId: string;
   isLoading: boolean;
@@ -119,7 +138,6 @@ const KubitIntegrationSettingsForm = ({
       apiKey: "",
       enabled: state?.enabled ?? false,
       syncIntervalMinutes: state?.syncIntervalMinutes ?? 60,
-      sessionOffsetMinutes: state?.sessionOffsetMinutes ?? 30,
       requestTimeoutSeconds: state?.requestTimeoutSeconds ?? 30,
     },
     disabled: isLoading,
@@ -131,7 +149,6 @@ const KubitIntegrationSettingsForm = ({
       apiKey: "",
       enabled: state?.enabled ?? false,
       syncIntervalMinutes: state?.syncIntervalMinutes ?? 60,
-      sessionOffsetMinutes: state?.sessionOffsetMinutes ?? 30,
       requestTimeoutSeconds: state?.requestTimeoutSeconds ?? 30,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -212,29 +229,6 @@ const KubitIntegrationSettingsForm = ({
               </FormControl>
               <FormDescription>
                 How often data is synced to Kubit (min: 15, max: 1440)
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-        <FormField
-          control={kubitForm.control}
-          name="sessionOffsetMinutes"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Session Offset (minutes)</FormLabel>
-              <FormControl>
-                <Input
-                  {...field}
-                  type="number"
-                  min={5}
-                  max={120}
-                  onChange={(e) => field.onChange(parseInt(e.target.value, 10))}
-                />
-              </FormControl>
-              <FormDescription>
-                How far behind now to sync — increase if sessions last longer
-                than 30 minutes (min: 5, max: 120)
               </FormDescription>
               <FormMessage />
             </FormItem>

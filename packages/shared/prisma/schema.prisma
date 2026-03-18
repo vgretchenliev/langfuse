@@ -1098,9 +1098,16 @@ model KubitIntegration {
   encryptedApiKey       String    @map("encrypted_api_key")
   enabled               Boolean
   syncIntervalMinutes   Int       @default(60) @map("sync_interval_minutes")
-  sessionOffsetMinutes  Int       @default(30) @map("session_offset_minutes")
   requestTimeoutSeconds Int       @default(30) @map("request_timeout_seconds")
-  lastSyncAt            DateTime? @map("last_sync_at")
+  encryptedAwsAccessKeyId     String?   @map("encrypted_aws_access_key_id")
+  encryptedAwsSecretAccessKey String?   @map("encrypted_aws_secret_access_key")
+  encryptedAwsSessionToken    String?   @map("encrypted_aws_session_token")
+  awsCredentialsExpiry        DateTime? @map("aws_credentials_expiry")
+  awsKinesisStreamName        String?   @map("aws_kinesis_stream_name")
+  awsKinesisRegion            String?   @map("aws_kinesis_region")
+  awsKinesisPartitionKey      String?   @map("aws_kinesis_partition_key")
+  lastSyncAt                  DateTime? @map("last_sync_at")
+  lastError                   String?   @map("last_error")
   createdAt             DateTime  @default(now()) @map("created_at")
 
   @@map("kubit_integrations")

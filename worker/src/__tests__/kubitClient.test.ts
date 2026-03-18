@@ -1,33 +1,67 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { KubitClient } from "../features/kubit/kubitClient";
 
-const ENDPOINT = "https://langfuse-ingest.kubit.ai";
-const API_KEY = "test-api-key";
-const MAX_BATCH_BYTES = 8 * 1024 * 1024; // 8 MB
+const PROJECT_ID = "project-abc-123";
+const WORKSPACE_ID = "workspace-xyz-456";
+
+const AWS_CREDS = {
+  awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE",
+  awsSecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  awsSessionToken: "test-session-token",
+  awsRegion: "us-east-1",
+  streamName: "langfuse-kubit-events",
+  projectId: PROJECT_ID,
+  workspaceId: WORKSPACE_ID,
+};
 
 function makeClient() {
   return new KubitClient({
-    endpointUrl: ENDPOINT,
-    apiKey: API_KEY,
+    ...AWS_CREDS,
     requestTimeoutSeconds: 30,
   });
 }
 
-function mockFetchOk() {
-  const calls: { body: { events: unknown[] }; byteSize: number }[] = [];
+/** Decode a single Kinesis record's Data field into the event it carries. */
+function decodeRecord(data: string): Record<string, unknown> {
+  return JSON.parse(Buffer.from(data, "base64").toString("utf8"));
+}
+
+type FetchCall = {
+  url: string;
+  headers: Record<string, string>;
+  body: {
+    StreamName: string;
+    Records: { Data: string; PartitionKey: string }[];
+  };
+  bodyBytes: number;
+};
+
+function mockFetchOk(): FetchCall[] {
+  const calls: FetchCall[] = [];
 
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (_url: string, init: RequestInit) => {
-      const body = init.body as string;
+    vi.fn(async (url: string, init: RequestInit) => {
+      const bodyStr = init.body as string;
+      const parsed = JSON.parse(bodyStr);
       calls.push({
-        body: JSON.parse(body),
-        byteSize: Buffer.byteLength(body, "utf8"),
+        url,
+        headers: init.headers as Record<string, string>,
+        body: parsed,
+        bodyBytes: Buffer.byteLength(bodyStr, "utf8"),
       });
       return {
         ok: true,
         text: async () => "",
-      } as Response;
+        json: async () => ({
+          FailedRecordCount: 0,
+          Records: parsed.Records.map(() => ({
+            SequenceNumber:
+              "49640338859349934440025507667573645222572899765701713922",
+            ShardId: "shardId-000000000000",
+          })),
+        }),
+      } as unknown as Response;
     }),
   );
 
@@ -38,12 +72,11 @@ beforeEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("KubitClient — size-based batching", () => {
-  it("sends a single batch when total payload is under 8 MB", async () => {
+describe("KubitClient — Kinesis PutRecords via REST", () => {
+  it("sends one Kinesis record per event in a single PutRecords call for a small batch", async () => {
     const calls = mockFetchOk();
     const client = makeClient();
 
-    // 10 events × ~1 KB each = ~10 KB total
     for (let i = 0; i < 10; i++) {
       client.addEvent({ entity_type: "score", id: `score-${i}`, value: i });
     }
@@ -51,17 +84,96 @@ describe("KubitClient — size-based batching", () => {
     await client.flush();
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].body.events).toHaveLength(10);
-    expect(calls[0].byteSize).toBeLessThan(MAX_BATCH_BYTES);
+    expect(calls[0].body.Records).toHaveLength(10);
+    expect(calls[0].body.StreamName).toBe(AWS_CREDS.streamName);
+    expect(calls[0].url).toBe(
+      `https://kinesis.${AWS_CREDS.awsRegion}.amazonaws.com/`,
+    );
   });
 
-  it("splits into multiple batches when total payload exceeds 8 MB", async () => {
+  it("sets required Kinesis headers including X-Amz-Target and Authorization", async () => {
+    const calls = mockFetchOk();
+    const client = makeClient();
+    client.addEvent({ entity_type: "score", id: "s1", value: 1 });
+    await client.flush();
+
+    const headers = calls[0].headers;
+    expect(headers["X-Amz-Target"]).toBe("Kinesis_20131202.PutRecords");
+    expect(headers["Content-Type"]).toBe("application/x-amz-json-1.1");
+    expect(headers["X-Amz-Security-Token"]).toBe(AWS_CREDS.awsSessionToken);
+    expect(headers["Authorization"]).toMatch(/^AWS4-HMAC-SHA256 Credential=/);
+  });
+
+  it("base64-encodes each record's Data as a single JSON event", async () => {
+    const calls = mockFetchOk();
+    const client = makeClient();
+    const event = { entity_type: "trace", id: "t1", name: "test" };
+    client.addEvent(event);
+    await client.flush();
+
+    const record = calls[0].body.Records[0];
+    const decoded = decodeRecord(record.Data);
+    // Event is enriched with wid (Kubit workspace ID) before encoding
+    expect(decoded).toEqual({ ...event, wid: WORKSPACE_ID });
+  });
+
+  it("adds wid field (projectId) to every event for Firehose dynamic partitioning", async () => {
     const calls = mockFetchOk();
     const client = makeClient();
 
-    // Each event ~1 MB (1M chars ≈ 1 MB UTF-8)
-    const bigText = "x".repeat(1_000_000);
-    for (let i = 0; i < 20; i++) {
+    client.addEvent({ entity_type: "trace", id: "t1" });
+    client.addEvent({ entity_type: "observation", id: "o1" });
+    client.addEvent({ entity_type: "score", id: "s1" });
+    await client.flush();
+
+    for (const record of calls[0].body.Records) {
+      const decoded = decodeRecord(record.Data);
+      expect(decoded.wid).toBe(WORKSPACE_ID);
+    }
+  });
+
+  it("uses projectId as the PartitionKey on every Kinesis record", async () => {
+    const calls = mockFetchOk();
+    const client = makeClient();
+
+    client.addEvent({ entity_type: "trace", id: "t1" });
+    client.addEvent({ entity_type: "score", id: "s1" });
+    await client.flush();
+
+    for (const record of calls[0].body.Records) {
+      expect(record.PartitionKey).toBe(WORKSPACE_ID);
+    }
+  });
+
+  it("splits into multiple PutRecords calls when records exceed 500 per call", async () => {
+    const calls = mockFetchOk();
+    const client = makeClient();
+
+    for (let i = 0; i < 1100; i++) {
+      client.addEvent({ entity_type: "score", id: `score-${i}`, value: i });
+    }
+
+    await client.flush();
+
+    // 1100 records → at least 3 PutRecords calls (≤ 500 records each)
+    expect(calls.length).toBeGreaterThanOrEqual(3);
+    for (const call of calls) {
+      expect(call.body.Records.length).toBeLessThanOrEqual(500);
+    }
+    const totalRecords = calls.reduce(
+      (sum, c) => sum + c.body.Records.length,
+      0,
+    );
+    expect(totalRecords).toBe(1100);
+  });
+
+  it("splits into multiple PutRecords calls when payload exceeds 5 MB per call", async () => {
+    const calls = mockFetchOk();
+    const client = makeClient();
+
+    // ~600 KB each; 10 × ~600 KB = ~6 MB > 5 MB → needs at least 2 PutRecords calls
+    const bigText = "x".repeat(600_000);
+    for (let i = 0; i < 10; i++) {
       client.addEvent({
         entity_type: "trace",
         id: `trace-${i}`,
@@ -71,34 +183,12 @@ describe("KubitClient — size-based batching", () => {
 
     await client.flush();
 
-    // 20 MB total → should be split into at least 3 batches of ≤8 MB each
-    expect(calls.length).toBeGreaterThanOrEqual(3);
-    for (const call of calls) {
-      expect(call.byteSize).toBeLessThanOrEqual(MAX_BATCH_BYTES);
-    }
-
-    // All events accounted for
-    const totalEvents = calls.reduce((sum, c) => sum + c.body.events.length, 0);
-    expect(totalEvents).toBe(20);
-  });
-
-  it("sends correct Authorization header", async () => {
-    const sentHeaders: HeadersInit[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string, init: RequestInit) => {
-        sentHeaders.push(init.headers as HeadersInit);
-        return { ok: true, text: async () => "" } as Response;
-      }),
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    const totalRecords = calls.reduce(
+      (sum, c) => sum + c.body.Records.length,
+      0,
     );
-
-    const client = makeClient();
-    client.addEvent({ entity_type: "score", id: "s1", value: 1 });
-    await client.flush();
-
-    expect(sentHeaders[0]).toMatchObject({
-      Authorization: `Bearer ${API_KEY}`,
-    });
+    expect(totalRecords).toBe(10);
   });
 
   it("does nothing when batch is empty", async () => {
@@ -118,5 +208,26 @@ describe("KubitClient — size-based batching", () => {
     await client.flush();
 
     expect(client.getBatchSize()).toBe(0);
+  });
+
+  it("shouldFlush returns false for a small buffer and true once the 25 MB threshold is reached", () => {
+    const client = makeClient();
+
+    // Small events — well below 25 MB
+    for (let i = 0; i < 10; i++) {
+      client.addEvent({ entity_type: "score", id: `s-${i}`, v: i });
+    }
+    expect(client.shouldFlush()).toBe(false);
+
+    // Add 26 × ~1.05 MB events = ~27.3 MB > 25 MB hard-coded threshold
+    const almostOneMb = "x".repeat(1_050_000);
+    for (let i = 0; i < 26; i++) {
+      client.addEvent({
+        entity_type: "trace",
+        id: `big-${i}`,
+        data: almostOneMb,
+      });
+    }
+    expect(client.shouldFlush()).toBe(true);
   });
 });

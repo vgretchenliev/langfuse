@@ -1,74 +1,242 @@
+import { createHash, createHmac } from "crypto";
 import { logger } from "@langfuse/shared/src/server";
 
 type KubitEvent = Record<string, unknown> & { entity_type: string };
 
+// Kinesis PutRecords hard limits
+const KINESIS_MAX_RECORDS_PER_CALL = 500;
+const KINESIS_MAX_BYTES_PER_CALL = 5 * 1024 * 1024; // 5 MB
+
 const MAX_RETRIES = 3;
-const MAX_BATCH_BYTES = 8 * 1024 * 1024; // 8 MB — 2 MB safety margin below API Gateway's 10 MB hard limit
+
+// Flush the in-memory buffer every 25 MB to bound peak memory usage during
+// large historical syncs.
+const FLUSH_THRESHOLD_BYTES = 25 * 1024 * 1024; // 25 MB
+
+// Max concurrent PutRecords calls per flush to avoid saturating the worker's
+// network — 3 × 5 MB = 15 MB in-flight at once is a reasonable ceiling.
+const PUT_RECORDS_CONCURRENCY = 3;
+
+// ── SigV4 helpers
+
+function hmac(key: Buffer | string, data: string): Buffer {
+  return createHmac("sha256", key).update(data).digest();
+}
+
+function sha256Hex(data: string): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+function getSigningKey(
+  secretKey: string,
+  dateStamp: string,
+  region: string,
+  service: string,
+): Buffer {
+  const kDate = hmac("AWS4" + secretKey, dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, service);
+  return hmac(kService, "aws4_request");
+}
+
+function buildAuthorizationHeader(params: {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  region: string;
+  amzDate: string;
+  dateStamp: string;
+  host: string;
+  bodyHash: string;
+  target: string;
+}): string {
+  const {
+    accessKeyId,
+    secretAccessKey,
+    sessionToken,
+    region,
+    amzDate,
+    dateStamp,
+    host,
+    bodyHash,
+    target,
+  } = params;
+
+  const service = "kinesis";
+
+  const canonicalHeaders = [
+    `content-type:application/x-amz-json-1.1`,
+    `host:${host}`,
+    `x-amz-date:${amzDate}`,
+    `x-amz-security-token:${sessionToken}`,
+    `x-amz-target:${target}`,
+  ].join("\n");
+
+  const signedHeaders =
+    "content-type;host;x-amz-date;x-amz-security-token;x-amz-target";
+
+  const canonicalRequest = [
+    "POST",
+    "/",
+    "",
+    canonicalHeaders + "\n",
+    signedHeaders,
+    bodyHash,
+  ].join("\n");
+
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join("\n");
+
+  const signingKey = getSigningKey(secretAccessKey, dateStamp, region, service);
+  const signature = hmac(signingKey, stringToSign).toString("hex");
+
+  return `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+}
+
+// ── Kinesis types ──
+
+type KinesisRecord = { Data: string; PartitionKey: string };
+
+type PutRecordsResponse = {
+  FailedRecordCount: number;
+  Records: Array<{
+    SequenceNumber?: string;
+    ShardId?: string;
+    ErrorCode?: string;
+    ErrorMessage?: string;
+  }>;
+};
+
+// ── KubitClient ──
 
 export class KubitClient {
-  private readonly endpointUrl: string;
-  private readonly apiKey: string;
+  private readonly awsAccessKeyId: string;
+  private readonly awsSecretAccessKey: string;
+  private readonly awsSessionToken: string;
+  private readonly awsRegion: string;
+  private readonly streamName: string;
+  private readonly projectId: string;
+  private readonly workspaceId: string;
   private readonly requestTimeoutMs: number;
   private batch: KubitEvent[] = [];
+  private batchBytes = 0;
 
   constructor({
-    endpointUrl,
-    apiKey,
+    awsAccessKeyId,
+    awsSecretAccessKey,
+    awsSessionToken,
+    awsRegion,
+    streamName,
+    projectId,
+    workspaceId,
     requestTimeoutSeconds,
   }: {
-    endpointUrl: string;
-    apiKey: string;
+    awsAccessKeyId: string;
+    awsSecretAccessKey: string;
+    awsSessionToken: string;
+    awsRegion: string;
+    streamName: string;
+    projectId: string;
+    workspaceId: string;
     requestTimeoutSeconds: number;
   }) {
-    this.endpointUrl = endpointUrl;
-    this.apiKey = apiKey;
+    this.awsAccessKeyId = awsAccessKeyId;
+    this.awsSecretAccessKey = awsSecretAccessKey;
+    this.awsSessionToken = awsSessionToken;
+    this.awsRegion = awsRegion;
+    this.streamName = streamName;
+    this.projectId = projectId;
+    this.workspaceId = workspaceId;
     this.requestTimeoutMs = requestTimeoutSeconds * 1000;
   }
 
+  /** No-op — kept for API compatibility. Built-in fetch manages connections automatically. */
+  public async destroy(): Promise<void> {}
+
+  /**
+   * Enrich the event with the workspace id (`wid`) used by Firehose dynamic
+   * partitioning to route records to the correct S3 prefix, then add it to
+   * the in-memory buffer.
+   */
   public addEvent(event: KubitEvent): void {
-    this.batch.push(event);
+    const enriched: KubitEvent = { ...event, wid: this.workspaceId };
+    const eventBytes = Buffer.byteLength(JSON.stringify(enriched), "utf8");
+    this.batch.push(enriched);
+    this.batchBytes += eventBytes;
+  }
+
+  /**
+   * Returns true when the in-memory buffer has reached FLUSH_THRESHOLD_BYTES —
+   * signal to the caller to call flush() to bound peak memory usage.
+   */
+  public shouldFlush(): boolean {
+    return this.batchBytes >= FLUSH_THRESHOLD_BYTES;
   }
 
   public async flush(): Promise<void> {
-    if (this.batch.length === 0) {
-      return;
-    }
+    if (this.batch.length === 0) return;
 
-    const chunks: KubitEvent[][] = [];
-    let currentChunk: KubitEvent[] = [];
-    let currentChunkBytes = 0;
+    // Split buffered events into PutRecords calls, each respecting:
+    //   • ≤ 500 records per call (Kinesis hard limit)
+    //   • ≤ 5 MB total per call (Kinesis hard limit)
+    //   • ≤ 1 MB per individual record (Kinesis hard limit)
+    // Each Kinesis record carries exactly one enriched event as a
+    // base64-encoded JSON string, keeping the format compatible with
+    // Firehose concatenation → NDJSON → Snowpipe ingestion.
+    const calls: KubitEvent[][] = [];
+    let currentCall: KubitEvent[] = [];
+    let currentCallBytes = 0;
 
     for (const event of this.batch) {
       const eventBytes = Buffer.byteLength(JSON.stringify(event), "utf8");
-      if (
-        currentChunk.length > 0 &&
-        currentChunkBytes + eventBytes > MAX_BATCH_BYTES
-      ) {
-        chunks.push(currentChunk);
-        currentChunk = [];
-        currentChunkBytes = 0;
+
+      const wouldExceedCount =
+        currentCall.length >= KINESIS_MAX_RECORDS_PER_CALL;
+      const wouldExceedBytes =
+        currentCall.length > 0 &&
+        currentCallBytes + eventBytes > KINESIS_MAX_BYTES_PER_CALL;
+
+      if (wouldExceedCount || wouldExceedBytes) {
+        calls.push(currentCall);
+        currentCall = [];
+        currentCallBytes = 0;
       }
-      currentChunk.push(event);
-      currentChunkBytes += eventBytes;
+
+      currentCall.push(event);
+      currentCallBytes += eventBytes;
     }
 
-    if (currentChunk.length > 0) {
-      chunks.push(currentChunk);
+    if (currentCall.length > 0) {
+      calls.push(currentCall);
     }
 
-    for (const chunk of chunks) {
-      await this.sendBatchWithRetry(chunk);
+    // Fire PutRecords calls in concurrency-limited batches over keep-alive
+    // connections — pipelining reduces round-trip wait while PUT_RECORDS_CONCURRENCY
+    // caps simultaneous in-flight uploads to avoid saturating the worker's network.
+    for (let i = 0; i < calls.length; i += PUT_RECORDS_CONCURRENCY) {
+      await Promise.all(
+        calls
+          .slice(i, i + PUT_RECORDS_CONCURRENCY)
+          .map((callEvents) => this.sendChunkWithRetry(callEvents)),
+      );
     }
 
     this.batch = [];
+    this.batchBytes = 0;
   }
 
-  private async sendBatchWithRetry(events: KubitEvent[]): Promise<void> {
+  private async sendChunkWithRetry(events: KubitEvent[]): Promise<void> {
     let lastError: Error | undefined;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        await this.sendBatch(events);
+        await this.putRecords(events);
         return;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
@@ -86,7 +254,89 @@ export class KubitClient {
     throw lastError;
   }
 
-  private async sendBatch(events: KubitEvent[]): Promise<void> {
+  /**
+   * Sends events to Kinesis, retrying only the throttled records on partial
+   * failures (FailedRecordCount > 0). Serialises each event once and reuses
+   * the KinesisRecord across retry attempts to avoid redundant work.
+   */
+  private async putRecords(events: KubitEvent[]): Promise<void> {
+    // Serialise once — reused across partial-failure retry attempts.
+    let pending: KinesisRecord[] = events.map((event) => ({
+      Data: Buffer.from(JSON.stringify(event)).toString("base64"),
+      PartitionKey: this.workspaceId,
+    }));
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      const result = await this.callPutRecords(pending);
+
+      if (result.FailedRecordCount === 0) {
+        logger.debug("[KUBIT] Successfully sent Kinesis batch", {
+          records: pending.length,
+          wid: this.workspaceId,
+        });
+        return;
+      }
+
+      // Collect only the throttled/failed records by index for the next attempt.
+      const failed = result.Records.reduce<KinesisRecord[]>((acc, r, i) => {
+        if (r.ErrorCode) acc.push(pending[i]);
+        return acc;
+      }, []);
+
+      logger.warn(
+        "[KUBIT] Partial PutRecords failure — retrying throttled records",
+        {
+          failed: failed.length,
+          total: pending.length,
+          attempt,
+          wid: this.workspaceId,
+        },
+      );
+
+      if (attempt === MAX_RETRIES) break;
+
+      const delayMs = 1000 * Math.pow(2, attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      pending = failed;
+    }
+
+    throw new Error(
+      `[KUBIT] ${pending.length} records failed after ${MAX_RETRIES} attempts`,
+    );
+  }
+
+  /** Raw HTTP PutRecords call — throws on HTTP errors, returns parsed response. */
+  private async callPutRecords(
+    records: KinesisRecord[],
+  ): Promise<PutRecordsResponse> {
+    const host = `kinesis.${this.awsRegion}.amazonaws.com`;
+    const target = "Kinesis_20131202.PutRecords";
+
+    const body = JSON.stringify({
+      StreamName: this.streamName,
+      Records: records,
+    });
+    const bodyHash = sha256Hex(body);
+
+    const now = new Date();
+    const amzDate = now
+      .toISOString()
+      .replace(/[:-]/g, "")
+      .replace(/\.\d{3}/, "");
+    const dateStamp = amzDate.slice(0, 8);
+
+    const authorization = buildAuthorizationHeader({
+      accessKeyId: this.awsAccessKeyId,
+      secretAccessKey: this.awsSecretAccessKey,
+      sessionToken: this.awsSessionToken,
+      region: this.awsRegion,
+      amzDate,
+      dateStamp,
+      host,
+      bodyHash,
+      target,
+    });
+
     const controller = new AbortController();
     const timeoutId = setTimeout(
       () => controller.abort(),
@@ -94,28 +344,32 @@ export class KubitClient {
     );
 
     try {
-      const response = await fetch(this.endpointUrl, {
+      const response = await fetch(`https://${host}/`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/x-amz-json-1.1",
+          Host: host,
+          "X-Amz-Date": amzDate,
+          "X-Amz-Security-Token": this.awsSessionToken,
+          "X-Amz-Target": target,
+          Authorization: authorization,
         },
-        body: JSON.stringify({ events }),
+        body,
         signal: controller.signal,
       });
 
       if (!response.ok) {
         const errorText = await response.text();
         logger.error(
-          `[KUBIT] Failed to send events: ${response.status} ${response.statusText}`,
+          `[KUBIT] Kinesis PutRecords HTTP error: ${response.status} ${response.statusText}`,
           { body: errorText },
         );
         throw new Error(
-          `Kubit API error: ${response.status} ${response.statusText}`,
+          `Kinesis PutRecords error: ${response.status} ${response.statusText}`,
         );
       }
 
-      logger.debug("[KUBIT] Successfully sent batch", { count: events.length });
+      return response.json() as Promise<PutRecordsResponse>;
     } finally {
       clearTimeout(timeoutId);
     }

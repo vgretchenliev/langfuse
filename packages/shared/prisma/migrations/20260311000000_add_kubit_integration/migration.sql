@@ -5,9 +5,16 @@ CREATE TABLE "kubit_integrations" (
     "encrypted_api_key" TEXT NOT NULL,
     "enabled" BOOLEAN NOT NULL,
     "sync_interval_minutes" INTEGER NOT NULL DEFAULT 60,
-    "session_offset_minutes" INTEGER NOT NULL DEFAULT 30,
     "request_timeout_seconds" INTEGER NOT NULL DEFAULT 30,
+    "encrypted_aws_access_key_id" TEXT,
+    "encrypted_aws_secret_access_key" TEXT,
+    "encrypted_aws_session_token" TEXT,
+    "aws_credentials_expiry" TIMESTAMP(3),
+    "aws_kinesis_stream_name" TEXT,
+    "aws_kinesis_region" TEXT,
+    "aws_kinesis_partition_key" TEXT,
     "last_sync_at" TIMESTAMP(3),
+    "last_error" TEXT,
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "kubit_integrations_pkey" PRIMARY KEY ("project_id")
