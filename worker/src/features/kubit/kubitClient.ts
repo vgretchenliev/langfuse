@@ -283,6 +283,9 @@ export class KubitClient {
         return acc;
       }, []);
 
+      const errorCodes = result.Records.filter((r) => r.ErrorCode).map(
+        (r) => r.ErrorCode,
+      );
       logger.warn(
         "[KUBIT] Partial PutRecords failure — retrying throttled records",
         {
@@ -290,6 +293,7 @@ export class KubitClient {
           total: pending.length,
           attempt,
           wid: this.workspaceId,
+          errorCodes: [...new Set(errorCodes)],
         },
       );
 
