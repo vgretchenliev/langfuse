@@ -1108,6 +1108,10 @@ model KubitIntegration {
   awsKinesisPartitionKey      String?   @map("aws_kinesis_partition_key")
   lastSyncAt                  DateTime? @map("last_sync_at")
   lastError                   String?   @map("last_error")
+  currentSyncMaxTimestamp     DateTime? @map("current_sync_max_timestamp")
+  tracesSyncedAt              DateTime? @map("traces_synced_at")
+  observationsSyncedAt        DateTime? @map("observations_synced_at")
+  scoresSyncedAt              DateTime? @map("scores_synced_at")
   createdAt             DateTime  @default(now()) @map("created_at")
 
   @@map("kubit_integrations")

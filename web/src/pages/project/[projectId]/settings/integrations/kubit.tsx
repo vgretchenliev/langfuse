@@ -4,6 +4,7 @@ import { StatusBadge } from "@/src/components/layouts/status-badge";
 import { Alert, AlertDescription } from "@/src/components/ui/alert";
 import { Button } from "@/src/components/ui/button";
 import { AlertTriangle } from "lucide-react";
+import Link from "next/link";
 import {
   Form,
   FormControl,
@@ -57,13 +58,24 @@ export default function KubitIntegrationSettings() {
           { name: "Settings", href: `/project/${projectId}/settings` },
         ],
         actionButtonsLeft: <>{status && <StatusBadge type={status} />}</>,
+        actionButtonsRight: (
+          <Button asChild variant="secondary">
+            <Link href="https://langfuse.com/integrations/analytics/kubit">
+              Integration Docs ↗
+            </Link>
+          </Button>
+        ),
       }}
     >
       <p className="mb-4 text-sm text-primary">
-        Integrate with Kubit to sync your Langfuse traces, observations, and
-        scores. Upon activation, all historical data from your project will be
-        synced. After the initial sync, new data is automatically synced on the
-        configured interval.
+        Integrate with{" "}
+        <Link href="https://kubit.ai" className="underline">
+          Kubit
+        </Link>{" "}
+        to sync your Langfuse traces, observations, and scores for advanced
+        product analytics. Upon activation, all historical data from your
+        project will be synced. After the initial sync, new data is
+        automatically synced on the configured interval.
       </p>
       {!hasAccess && (
         <p className="text-sm">

@@ -571,6 +571,10 @@ export type KubitIntegration = {
   aws_kinesis_partition_key: string | null;
   last_sync_at: Timestamp | null;
   last_error: string | null;
+  current_sync_max_timestamp: Timestamp | null;
+  traces_synced_at: Timestamp | null;
+  observations_synced_at: Timestamp | null;
+  scores_synced_at: Timestamp | null;
   created_at: Generated<Timestamp>;
 };
 export type LegacyPrismaObservation = {

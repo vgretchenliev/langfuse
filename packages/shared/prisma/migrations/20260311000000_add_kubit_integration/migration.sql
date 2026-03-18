@@ -15,6 +15,10 @@ CREATE TABLE "kubit_integrations" (
     "aws_kinesis_partition_key" TEXT,
     "last_sync_at" TIMESTAMP(3),
     "last_error" TEXT,
+    "current_sync_max_timestamp" TIMESTAMP(3),
+    "traces_synced_at" TIMESTAMP(3),
+    "observations_synced_at" TIMESTAMP(3),
+    "scores_synced_at" TIMESTAMP(3),
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "kubit_integrations_pkey" PRIMARY KEY ("project_id")

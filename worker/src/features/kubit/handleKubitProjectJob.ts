@@ -11,6 +11,7 @@ import {
 import { prisma } from "@langfuse/shared/src/db";
 import { decrypt, encrypt } from "@langfuse/shared/encryption";
 import { KubitClient } from "./kubitClient";
+import { RedisLock } from "../../utils/RedisLock";
 import { z } from "zod/v4";
 
 // ── Token endpoint ──
@@ -302,37 +303,159 @@ export const handleKubitProjectJob = async (
 
   logger.info(`[KUBIT] Processing Kubit integration for project ${projectId}`);
 
-  const awsCredentials = await getOrRefreshAwsCredentials({ dbIntegration });
+  // Distributed lock — ensures only one worker processes this project at a time.
+  // TTL is 4 hours; the lock is released atomically in the finally block so
+  // normal runs don't hold it for the full TTL.
+  const lock = new RedisLock(`kubit:lock:${projectId}`, {
+    ttlSeconds: 4 * 60 * 60,
+    name: "KUBIT",
+    onUnavailable: "proceed",
+  });
 
-  // Permanent auth failure — integration has been disabled, nothing left to do.
-  if (!awsCredentials) return;
-
-  const config: KubitConfig = {
-    projectId,
-    minTimestamp: dbIntegration.lastSyncAt ?? new Date("2000-01-01"),
-    maxTimestamp: new Date(),
-    requestTimeoutSeconds: dbIntegration.requestTimeoutSeconds,
-    ...awsCredentials,
-  };
+  const lockResult = await lock.acquire();
+  if (lockResult === "held_by_other") {
+    logger.info(
+      `[KUBIT] Another worker is already processing project ${projectId}, skipping`,
+    );
+    return;
+  }
 
   try {
-    await Promise.all([
-      processKubitTraces(config),
-      processKubitObservations(config),
-      processKubitScores(config),
+    const awsCredentials = await getOrRefreshAwsCredentials({ dbIntegration });
+
+    // Permanent auth failure — integration has been disabled, nothing left to do.
+    if (!awsCredentials) return;
+
+    // ── Determine the sync window ──
+    //
+    // On the first attempt we pick a fresh maxTimestamp and persist it so that
+    // every retry uses the exact same window. This prevents the window from
+    // drifting forward on retries, which would cause gaps or leave already-
+    // succeeded processors running against a different range the second time.
+    const maxTimestamp: Date =
+      dbIntegration.currentSyncMaxTimestamp ?? new Date();
+
+    if (!dbIntegration.currentSyncMaxTimestamp) {
+      await prisma.kubitIntegration.update({
+        where: { projectId },
+        data: { currentSyncMaxTimestamp: maxTimestamp },
+      });
+      logger.info(
+        `[KUBIT] Starting new sync window for project ${projectId} up to ${maxTimestamp.toISOString()}`,
+      );
+    } else {
+      logger.info(
+        `[KUBIT] Retrying sync window for project ${projectId} up to ${maxTimestamp.toISOString()}`,
+      );
+    }
+
+    const config: KubitConfig = {
+      projectId,
+      minTimestamp: dbIntegration.lastSyncAt ?? new Date("2000-01-01"),
+      maxTimestamp,
+      requestTimeoutSeconds: dbIntegration.requestTimeoutSeconds,
+      ...awsCredentials,
+    };
+
+    // ── Per-processor skip logic ──
+    //
+    // After each processor completes successfully we write its syncedAt timestamp
+    // to the DB. On retry we read back those timestamps and skip any processor
+    // that already finished within this sync window — preventing duplicate sends
+    // for the processors that succeeded before the failure.
+    const alreadySynced = (syncedAt: Date | null): boolean =>
+      syncedAt !== null && syncedAt.getTime() >= maxTimestamp.getTime();
+
+    const runOrSkip = async (
+      name: string,
+      syncedAt: Date | null,
+      run: () => Promise<void>,
+      markDone: () => Promise<void>,
+    ): Promise<void> => {
+      if (alreadySynced(syncedAt)) {
+        logger.info(
+          `[KUBIT] Skipping ${name} for project ${projectId} — already synced in this window`,
+        );
+        return;
+      }
+      await run();
+      await markDone();
+    };
+
+    // Use allSettled so all three processors always run to completion before we
+    // throw — prevents lingering processors from Worker N overlapping with the
+    // retry picked up by Worker N+1, which would cascade throttling on Kinesis.
+    const results = await Promise.allSettled([
+      runOrSkip(
+        "traces",
+        dbIntegration.tracesSyncedAt,
+        () => processKubitTraces(config),
+        () =>
+          prisma.kubitIntegration
+            .update({
+              where: { projectId },
+              data: { tracesSyncedAt: maxTimestamp },
+            })
+            .then(() => undefined),
+      ),
+      runOrSkip(
+        "observations",
+        dbIntegration.observationsSyncedAt,
+        () => processKubitObservations(config),
+        () =>
+          prisma.kubitIntegration
+            .update({
+              where: { projectId },
+              data: { observationsSyncedAt: maxTimestamp },
+            })
+            .then(() => undefined),
+      ),
+      runOrSkip(
+        "scores",
+        dbIntegration.scoresSyncedAt,
+        () => processKubitScores(config),
+        () =>
+          prisma.kubitIntegration
+            .update({
+              where: { projectId },
+              data: { scoresSyncedAt: maxTimestamp },
+            })
+            .then(() => undefined),
+      ),
     ]);
 
+    const failed = results.filter((r) => r.status === "rejected");
+    if (failed.length > 0) {
+      const errors = failed.map((r) =>
+        r.status === "rejected" ? r.reason : null,
+      );
+      errors.forEach((error) => {
+        logger.error(
+          `[KUBIT] Error processing Kubit integration for project ${projectId}`,
+          error,
+        );
+      });
+      throw errors[0];
+    }
+
+    // All three processors finished — advance the sync cursor and clear the
+    // per-processor tracking so the next cron run starts fresh.
     await prisma.kubitIntegration.update({
       where: { projectId },
-      data: { lastSyncAt: config.maxTimestamp, lastError: null },
+      data: {
+        lastSyncAt: maxTimestamp,
+        lastError: null,
+        currentSyncMaxTimestamp: null,
+        tracesSyncedAt: null,
+        observationsSyncedAt: null,
+        scoresSyncedAt: null,
+      },
     });
 
     logger.info(`[KUBIT] Kubit integration complete for project ${projectId}`);
-  } catch (error) {
-    logger.error(
-      `[KUBIT] Error processing Kubit integration for project ${projectId}`,
-      error,
-    );
-    throw error;
+  } finally {
+    if (lockResult === "acquired") {
+      await lock.release();
+    }
   }
 };

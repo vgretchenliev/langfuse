@@ -117,7 +117,7 @@ describe("KubitClient — Kinesis PutRecords via REST", () => {
     expect(decoded).toEqual({ ...event, wid: WORKSPACE_ID });
   });
 
-  it("adds wid field (projectId) to every event for Firehose dynamic partitioning", async () => {
+  it("adds wid field (projectId) to every event for dynamic partitioning", async () => {
     const calls = mockFetchOk();
     const client = makeClient();
 
@@ -132,7 +132,7 @@ describe("KubitClient — Kinesis PutRecords via REST", () => {
     }
   });
 
-  it("uses projectId as the PartitionKey on every Kinesis record", async () => {
+  it("uses wid/event.id as the PartitionKey when event.id is a non-empty string", async () => {
     const calls = mockFetchOk();
     const client = makeClient();
 
@@ -140,12 +140,34 @@ describe("KubitClient — Kinesis PutRecords via REST", () => {
     client.addEvent({ entity_type: "score", id: "s1" });
     await client.flush();
 
+    expect(calls[0].body.Records[0].PartitionKey).toBe(`${WORKSPACE_ID}/t1`);
+    expect(calls[0].body.Records[1].PartitionKey).toBe(`${WORKSPACE_ID}/s1`);
+  });
+
+  it("falls back to wid/randomUUID as the PartitionKey when event.id is absent or non-string", async () => {
+    const calls = mockFetchOk();
+    const client = makeClient();
+
+    // No id field
+    client.addEvent({ entity_type: "trace" });
+    // Numeric id
+    client.addEvent({ entity_type: "score", id: 42 } as unknown as Parameters<
+      typeof client.addEvent
+    >[0]);
+    // Empty string id
+    client.addEvent({ entity_type: "observation", id: "" });
+    await client.flush();
+
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
     for (const record of calls[0].body.Records) {
-      expect(record.PartitionKey).toBe(WORKSPACE_ID);
+      const [wid, id] = record.PartitionKey.split("/");
+      expect(wid).toBe(WORKSPACE_ID);
+      expect(uuidRegex.test(id)).toBe(true);
     }
   });
 
-  it("splits into multiple PutRecords calls when records exceed 500 per call", async () => {
+  it("splits into multiple PutRecords calls when records exceed 250 per call", async () => {
     const calls = mockFetchOk();
     const client = makeClient();
 
@@ -155,10 +177,10 @@ describe("KubitClient — Kinesis PutRecords via REST", () => {
 
     await client.flush();
 
-    // 1100 records → at least 3 PutRecords calls (≤ 500 records each)
-    expect(calls.length).toBeGreaterThanOrEqual(3);
+    // 1100 records → at least 5 PutRecords calls (≤ 250 records each)
+    expect(calls.length).toBeGreaterThanOrEqual(5);
     for (const call of calls) {
-      expect(call.body.Records.length).toBeLessThanOrEqual(500);
+      expect(call.body.Records.length).toBeLessThanOrEqual(250);
     }
     const totalRecords = calls.reduce(
       (sum, c) => sum + c.body.Records.length,

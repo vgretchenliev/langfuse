@@ -347,6 +347,14 @@ const Integrations = (props: { projectId: string }) => {
             >
               Configure
             </ActionButton>
+            <Button asChild variant="ghost">
+              <Link
+                href="https://langfuse.com/integrations/analytics/kubit"
+                target="_blank"
+              >
+                Integration Docs ↗
+              </Link>
+            </Button>
           </div>
         </Card>
 

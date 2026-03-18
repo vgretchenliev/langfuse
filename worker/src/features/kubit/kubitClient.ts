@@ -1,21 +1,24 @@
-import { createHash, createHmac } from "crypto";
+import { createHash, createHmac, randomUUID } from "crypto";
 import { logger } from "@langfuse/shared/src/server";
 
 type KubitEvent = Record<string, unknown> & { entity_type: string };
 
 // Kinesis PutRecords hard limits
-const KINESIS_MAX_RECORDS_PER_CALL = 500;
+const KINESIS_MAX_RECORDS_PER_CALL = 250;
 const KINESIS_MAX_BYTES_PER_CALL = 5 * 1024 * 1024; // 5 MB
 
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 5;
 
 // Flush the in-memory buffer every 25 MB to bound peak memory usage during
 // large historical syncs.
 const FLUSH_THRESHOLD_BYTES = 25 * 1024 * 1024; // 25 MB
 
-// Max concurrent PutRecords calls per flush to avoid saturating the worker's
-// network — 3 × 5 MB = 15 MB in-flight at once is a reasonable ceiling.
-const PUT_RECORDS_CONCURRENCY = 3;
+// One PutRecords call at a time per processor — 3 processors run in parallel
+// so the total in-flight is 3 × 1 = 3 concurrent calls (3,000 records/burst
+// across 12 shards = 250 records/shard). Higher concurrency causes thundering
+// herd during backfills: retries from failed batches overlap with new batches
+// and compound the throttling.
+const PUT_RECORDS_CONCURRENCY = 1;
 
 // ── SigV4 helpers
 
@@ -160,9 +163,7 @@ export class KubitClient {
   public async destroy(): Promise<void> {}
 
   /**
-   * Enrich the event with the workspace id (`wid`) used by Firehose dynamic
-   * partitioning to route records to the correct S3 prefix, then add it to
-   * the in-memory buffer.
+   * Enrich the event with the workspace id
    */
   public addEvent(event: KubitEvent): void {
     const enriched: KubitEvent = { ...event, wid: this.workspaceId };
@@ -240,7 +241,11 @@ export class KubitClient {
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         if (attempt < MAX_RETRIES) {
-          const delayMs = 1000 * Math.pow(2, attempt - 1);
+          // Exponential backoff with ±25% jitter so the 3 parallel processors
+          // don't all retry at the same instant (thundering herd).
+          const base = 5000 * Math.pow(2, attempt - 1); // 5s → 10s → 20s
+          const jitter = base * 0.25 * (Math.random() * 2 - 1); // ±25%
+          const delayMs = Math.round(base + jitter);
           logger.warn(
             `[KUBIT] Attempt ${attempt}/${MAX_RETRIES} failed, retrying in ${delayMs}ms`,
             { error: lastError.message },
@@ -260,9 +265,12 @@ export class KubitClient {
    */
   private async putRecords(events: KubitEvent[]): Promise<void> {
     // Serialise once — reused across partial-failure retry attempts.
+    // Partition key format: "{wid}/{event.id}"
+    const eventId = (event: KubitEvent) =>
+      typeof event.id === "string" && event.id ? event.id : randomUUID();
     let pending: KinesisRecord[] = events.map((event) => ({
       Data: Buffer.from(JSON.stringify(event)).toString("base64"),
-      PartitionKey: this.workspaceId,
+      PartitionKey: `${this.workspaceId}/${eventId(event)}`,
     }));
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -282,18 +290,13 @@ export class KubitClient {
         return acc;
       }, []);
 
-      const errorCodes = result.Records.filter((r) => r.ErrorCode).map(
-        (r) => r.ErrorCode,
-      );
+      const errorCodes = [
+        ...new Set(
+          result.Records.filter((r) => r.ErrorCode).map((r) => r.ErrorCode),
+        ),
+      ];
       logger.warn(
-        "[KUBIT] Partial PutRecords failure — retrying throttled records",
-        {
-          failed: failed.length,
-          total: pending.length,
-          attempt,
-          wid: this.workspaceId,
-          errorCodes: [...new Set(errorCodes)],
-        },
+        `[KUBIT] Partial PutRecords failure — failed=${failed.length}/${pending.length} attempt=${attempt} errorCodes=${errorCodes.join(",")} wid=${this.workspaceId}`,
       );
 
       if (attempt === MAX_RETRIES) break;
