@@ -7,6 +7,7 @@ import {
   getTracesForKubit,
   getObservationsForKubit,
   getScoresForKubit,
+  getEventsForKubit,
 } from "@langfuse/shared/src/server";
 import { prisma } from "@langfuse/shared/src/db";
 import { decrypt, encrypt } from "@langfuse/shared/encryption";
@@ -277,6 +278,46 @@ const processKubitScores = async (config: KubitConfig) => {
   }
 };
 
+const processKubitEvents = async (config: KubitConfig) => {
+  const events = getEventsForKubit(
+    config.projectId,
+    config.minTimestamp,
+    config.maxTimestamp,
+  );
+
+  const client = new KubitClient({
+    awsAccessKeyId: config.awsAccessKeyId,
+    awsSecretAccessKey: config.awsSecretAccessKey,
+    awsSessionToken: config.awsSessionToken,
+    awsRegion: config.awsKinesisRegion,
+    streamName: config.awsKinesisStreamName,
+    projectId: config.projectId,
+    workspaceId: config.awsKinesisPartitionKey,
+    requestTimeoutSeconds: config.requestTimeoutSeconds,
+  });
+  let count = 0;
+
+  try {
+    for await (const event of events) {
+      count++;
+      client.addEvent(event);
+      if (client.shouldFlush()) {
+        await client.flush();
+        logger.info(
+          `[KUBIT] Sent ${count} enriched observations for project ${config.projectId}`,
+        );
+      }
+    }
+
+    await client.flush();
+    logger.info(
+      `[KUBIT] Sent ${count} enriched observations for project ${config.projectId}`,
+    );
+  } finally {
+    await client.destroy();
+  }
+};
+
 // ── Main job handler ──
 
 export const handleKubitProjectJob = async (
@@ -382,34 +423,13 @@ export const handleKubitProjectJob = async (
       await markDone();
     };
 
-    // Use allSettled so all three processors always run to completion before we
+    // Use allSettled so all processors always run to completion before we
     // throw — prevents lingering processors from Worker N overlapping with the
     // retry picked up by Worker N+1, which would cascade throttling on Kinesis.
-    const results = await Promise.allSettled([
-      runOrSkip(
-        "traces",
-        dbIntegration.tracesSyncedAt,
-        () => processKubitTraces(config),
-        () =>
-          prisma.kubitIntegration
-            .update({
-              where: { projectId },
-              data: { tracesSyncedAt: maxTimestamp },
-            })
-            .then(() => undefined),
-      ),
-      runOrSkip(
-        "observations",
-        dbIntegration.observationsSyncedAt,
-        () => processKubitObservations(config),
-        () =>
-          prisma.kubitIntegration
-            .update({
-              where: { projectId },
-              data: { observationsSyncedAt: maxTimestamp },
-            })
-            .then(() => undefined),
-      ),
+    const processors: Promise<void>[] = [];
+
+    // Scores always run regardless of exportSource
+    processors.push(
       runOrSkip(
         "scores",
         dbIntegration.scoresSyncedAt,
@@ -422,7 +442,63 @@ export const handleKubitProjectJob = async (
             })
             .then(() => undefined),
       ),
-    ]);
+    );
+
+    // Traces and legacy observations — TRACES_OBSERVATIONS or TRACES_OBSERVATIONS_EVENTS
+    if (
+      dbIntegration.exportSource === "TRACES_OBSERVATIONS" ||
+      dbIntegration.exportSource === "TRACES_OBSERVATIONS_EVENTS"
+    ) {
+      processors.push(
+        runOrSkip(
+          "traces",
+          dbIntegration.tracesSyncedAt,
+          () => processKubitTraces(config),
+          () =>
+            prisma.kubitIntegration
+              .update({
+                where: { projectId },
+                data: { tracesSyncedAt: maxTimestamp },
+              })
+              .then(() => undefined),
+        ),
+        runOrSkip(
+          "observations",
+          dbIntegration.observationsSyncedAt,
+          () => processKubitObservations(config),
+          () =>
+            prisma.kubitIntegration
+              .update({
+                where: { projectId },
+                data: { observationsSyncedAt: maxTimestamp },
+              })
+              .then(() => undefined),
+        ),
+      );
+    }
+
+    // Enriched observations from the events table — EVENTS or TRACES_OBSERVATIONS_EVENTS
+    if (
+      dbIntegration.exportSource === "EVENTS" ||
+      dbIntegration.exportSource === "TRACES_OBSERVATIONS_EVENTS"
+    ) {
+      processors.push(
+        runOrSkip(
+          "enriched observations",
+          dbIntegration.eventsSyncedAt,
+          () => processKubitEvents(config),
+          () =>
+            prisma.kubitIntegration
+              .update({
+                where: { projectId },
+                data: { eventsSyncedAt: maxTimestamp },
+              })
+              .then(() => undefined),
+        ),
+      );
+    }
+
+    const results = await Promise.allSettled(processors);
 
     const failed = results.filter((r) => r.status === "rejected");
     if (failed.length > 0) {
@@ -448,6 +524,7 @@ export const handleKubitProjectJob = async (
         currentSyncMaxTimestamp: null,
         tracesSyncedAt: null,
         observationsSyncedAt: null,
+        eventsSyncedAt: null,
         scoresSyncedAt: null,
       },
     });

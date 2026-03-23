@@ -94,6 +94,7 @@ function makeIntegration(
     tracesSyncedAt: null,
     observationsSyncedAt: null,
     scoresSyncedAt: null,
+    exportSource: "TRACES_OBSERVATIONS",
     createdAt: new Date(),
     ...overrides,
   };

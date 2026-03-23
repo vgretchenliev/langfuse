@@ -562,6 +562,7 @@ export type KubitIntegration = {
   enabled: boolean;
   sync_interval_minutes: Generated<number>;
   request_timeout_seconds: Generated<number>;
+  export_source: Generated<AnalyticsIntegrationExportSource>;
   encrypted_aws_access_key_id: string | null;
   encrypted_aws_secret_access_key: string | null;
   encrypted_aws_session_token: string | null;
@@ -574,6 +575,7 @@ export type KubitIntegration = {
   current_sync_max_timestamp: Timestamp | null;
   traces_synced_at: Timestamp | null;
   observations_synced_at: Timestamp | null;
+  events_synced_at: Timestamp | null;
   scores_synced_at: Timestamp | null;
   created_at: Generated<Timestamp>;
 };
