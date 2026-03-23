@@ -511,6 +511,16 @@ export const handleKubitProjectJob = async (
           error,
         );
       });
+
+      const errorMessage = errors
+        .map((e) => (e instanceof Error ? e.message : String(e)))
+        .join("; ");
+
+      await prisma.kubitIntegration.update({
+        where: { projectId },
+        data: { lastError: errorMessage },
+      });
+
       throw errors[0];
     }
 

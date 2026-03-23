@@ -95,6 +95,7 @@ function makeIntegration(
     currentSyncMaxTimestamp: null,
     tracesSyncedAt: null,
     observationsSyncedAt: null,
+    eventsSyncedAt: null,
     scoresSyncedAt: null,
     exportSource: "TRACES_OBSERVATIONS",
     createdAt: new Date(),
@@ -536,6 +537,25 @@ describe("handleKubitProjectJob", () => {
       expect(hasSyncedAt("scoresSyncedAt")).toBe(true);
     });
 
+    it("writes lastError to DB when a processor fails", async () => {
+      vi.mocked(getTracesForKubit).mockReturnValue(
+        throwingGenerator("kinesis throttled"),
+      );
+
+      await expect(handleKubitProjectJob(makeJob())).rejects.toThrow();
+
+      const errorUpdate = vi
+        .mocked(prisma.kubitIntegration.update)
+        .mock.calls.find(
+          ([args]) => "lastError" in args.data && args.data.lastError !== null,
+        );
+
+      expect(errorUpdate).toBeDefined();
+      expect(
+        (errorUpdate![0].data as Record<string, unknown>).lastError,
+      ).toContain("kinesis throttled");
+    });
+
     it("does not advance lastSyncAt when any processor fails", async () => {
       vi.mocked(getScoresForKubit).mockReturnValue(throwingGenerator());
 
@@ -605,6 +625,234 @@ describe("handleKubitProjectJob", () => {
         (url as string).includes("/token"),
       );
       expect(tokenCalls).toHaveLength(0);
+    });
+
+    it("refreshes credentials expiring within 5 minutes (buffer window)", async () => {
+      const fetchMock = stubFetch();
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({
+          // Expiry is 4 minutes away — inside the 5-minute refresh buffer
+          awsCredentialsExpiry: new Date(Date.now() + 4 * 60 * 1000),
+        }) as never,
+      );
+
+      await handleKubitProjectJob(makeJob());
+
+      const tokenCalls = fetchMock.mock.calls.filter(([url]) =>
+        (url as string).includes("/token"),
+      );
+      expect(tokenCalls).toHaveLength(1);
+    });
+
+    it("disables the integration and returns cleanly on 403", async () => {
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({
+          encryptedAwsAccessKeyId: null,
+          awsCredentialsExpiry: null,
+        }) as never,
+      );
+      stubFetch({ tokenStatus: 403 });
+
+      await expect(handleKubitProjectJob(makeJob())).resolves.toBeUndefined();
+
+      expect(prisma.kubitIntegration.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ enabled: false }),
+        }),
+      );
+    });
+
+    it("throws (does not disable) on transient token endpoint errors (500)", async () => {
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({
+          encryptedAwsAccessKeyId: null,
+          awsCredentialsExpiry: null,
+        }) as never,
+      );
+      stubFetch({ tokenStatus: 500 });
+
+      await expect(handleKubitProjectJob(makeJob())).rejects.toThrow();
+
+      // Integration must NOT be disabled — this is retryable
+      const disableCall = vi
+        .mocked(prisma.kubitIntegration.update)
+        .mock.calls.find(([args]) => args.data.enabled === false);
+      expect(disableCall).toBeUndefined();
+    });
+  });
+
+  // ── Sync cursor (minTimestamp) ────────────────────────────────────────────────
+
+  describe("sync cursor (minTimestamp)", () => {
+    it("uses lastSyncAt as minTimestamp when set", async () => {
+      const lastSync = new Date("2026-01-01T08:00:00.000Z");
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({ lastSyncAt: lastSync }) as never,
+      );
+
+      await handleKubitProjectJob(makeJob());
+
+      expect(getTracesForKubit).toHaveBeenCalledWith(
+        "project-123",
+        lastSync,
+        expect.any(Date),
+      );
+    });
+
+    it("falls back to year 2000 when lastSyncAt is null (first ever sync)", async () => {
+      await handleKubitProjectJob(makeJob());
+
+      const [, minTs] = vi.mocked(getTracesForKubit).mock.calls[0];
+      expect(minTs).toEqual(new Date("2000-01-01"));
+    });
+  });
+
+  // ── Export source routing ─────────────────────────────────────────────────────
+
+  describe("export source routing", () => {
+    it("TRACES_OBSERVATIONS: calls traces, observations, scores — not events", async () => {
+      // Default exportSource in makeIntegration is TRACES_OBSERVATIONS
+      await handleKubitProjectJob(makeJob());
+
+      expect(getTracesForKubit).toHaveBeenCalled();
+      expect(getObservationsForKubit).toHaveBeenCalled();
+      expect(getScoresForKubit).toHaveBeenCalled();
+      expect(getEventsForKubit).not.toHaveBeenCalled();
+    });
+
+    it("EVENTS: calls events and scores — not traces or observations", async () => {
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({ exportSource: "EVENTS" }) as never,
+      );
+
+      await handleKubitProjectJob(makeJob());
+
+      expect(getEventsForKubit).toHaveBeenCalled();
+      expect(getScoresForKubit).toHaveBeenCalled();
+      expect(getTracesForKubit).not.toHaveBeenCalled();
+      expect(getObservationsForKubit).not.toHaveBeenCalled();
+    });
+
+    it("TRACES_OBSERVATIONS_EVENTS: calls all four processors", async () => {
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({
+          exportSource: "TRACES_OBSERVATIONS_EVENTS",
+        }) as never,
+      );
+
+      await handleKubitProjectJob(makeJob());
+
+      expect(getTracesForKubit).toHaveBeenCalled();
+      expect(getObservationsForKubit).toHaveBeenCalled();
+      expect(getScoresForKubit).toHaveBeenCalled();
+      expect(getEventsForKubit).toHaveBeenCalled();
+    });
+
+    it("EVENTS: passes the correct timestamps to getEventsForKubit", async () => {
+      const pinnedTs = new Date("2026-01-01T10:00:00.000Z");
+      const lastSync = new Date("2026-01-01T08:00:00.000Z");
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({
+          exportSource: "EVENTS",
+          currentSyncMaxTimestamp: pinnedTs,
+          lastSyncAt: lastSync,
+        }) as never,
+      );
+
+      await handleKubitProjectJob(makeJob());
+
+      expect(getEventsForKubit).toHaveBeenCalledWith(
+        "project-123",
+        lastSync,
+        pinnedTs,
+      );
+    });
+
+    it("EVENTS: marks eventsSyncedAt after completion", async () => {
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({ exportSource: "EVENTS" }) as never,
+      );
+
+      await handleKubitProjectJob(makeJob());
+
+      const eventsUpdate = vi
+        .mocked(prisma.kubitIntegration.update)
+        .mock.calls.find(
+          ([args]) =>
+            "eventsSyncedAt" in args.data && args.data.eventsSyncedAt !== null,
+        );
+      expect(eventsUpdate).toBeDefined();
+    });
+
+    it("EVENTS: skips events when eventsSyncedAt >= currentSyncMaxTimestamp", async () => {
+      const ts = new Date("2026-01-01T10:00:00.000Z");
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({
+          exportSource: "EVENTS",
+          currentSyncMaxTimestamp: ts,
+          eventsSyncedAt: ts,
+        }) as never,
+      );
+
+      await handleKubitProjectJob(makeJob());
+
+      expect(getEventsForKubit).not.toHaveBeenCalled();
+      expect(getScoresForKubit).toHaveBeenCalled();
+    });
+
+    it("EVENTS: clears eventsSyncedAt in final cleanup", async () => {
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({ exportSource: "EVENTS" }) as never,
+      );
+
+      await handleKubitProjectJob(makeJob());
+
+      const cleanupUpdate = vi
+        .mocked(prisma.kubitIntegration.update)
+        .mock.calls.find(([args]) => "lastSyncAt" in args.data);
+
+      expect(cleanupUpdate).toBeDefined();
+      const data = cleanupUpdate![0].data as Record<string, unknown>;
+      expect(data.eventsSyncedAt).toBeNull();
+    });
+
+    it("TRACES_OBSERVATIONS_EVENTS: events failure does not prevent traces/observations/scores from completing", async () => {
+      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
+        makeIntegration({
+          exportSource: "TRACES_OBSERVATIONS_EVENTS",
+        }) as never,
+      );
+      vi.mocked(getEventsForKubit).mockReturnValue(
+        throwingGenerator("events table unavailable"),
+      );
+
+      await expect(handleKubitProjectJob(makeJob())).rejects.toThrow(
+        "events table unavailable",
+      );
+
+      const updateCalls = vi
+        .mocked(prisma.kubitIntegration.update)
+        .mock.calls.map(([args]) => Object.keys(args.data));
+
+      const hasSyncedAt = (key: string) =>
+        updateCalls.some((keys) => keys.includes(key));
+
+      // Events failed — NOT marked done
+      expect(
+        updateCalls.some(
+          (keys) =>
+            keys.includes("eventsSyncedAt") &&
+            vi
+              .mocked(prisma.kubitIntegration.update)
+              .mock.calls.find(([args]) => "eventsSyncedAt" in args.data)?.[0]
+              .data.eventsSyncedAt !== null,
+        ),
+      ).toBe(false);
+
+      // The rest completed and ARE marked done
+      expect(hasSyncedAt("tracesSyncedAt")).toBe(true);
+      expect(hasSyncedAt("observationsSyncedAt")).toBe(true);
+      expect(hasSyncedAt("scoresSyncedAt")).toBe(true);
     });
   });
 });

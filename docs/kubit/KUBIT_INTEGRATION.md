@@ -1,6 +1,6 @@
-# Kubit Integration
+# Kubit Analytics Integration
 
-This document describes the Kubit integration added to Langfuse. It enables automatic, scheduled export of traces, observations, and scores from Langfuse to a configurable Kubit ingest endpoint.
+This document describes the Kubit analytics integration added to Langfuse. It enables automatic, scheduled export of traces, observations, scores, and enriched events from Langfuse to an AWS Kinesis Data Stream, from which downstream analytics systems can consume the data.
 
 ---
 
@@ -15,44 +15,33 @@ This document describes the Kubit integration added to Langfuse. It enables auto
 │                              ┌──────────┘                          │
 │                              │  PostgreSQL                          │
 │                              │  kubit_integrations table           │
-│                              │  (endpoint_url, encrypted_api_key,  │
-│                              │   enabled, sync_interval_minutes,   │
-│                              │   session_offset_minutes,           │
-│                              │   request_timeout_seconds,          │
-│                              │   last_sync_at)                     │
 └──────────────────────────────┼──────────────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────────────┐
 │  Langfuse Worker                                                    │
 │                                                                     │
-│  ┌─────────────────────────────────────────────────────┐           │
-│  │  KubitIntegrationQueue  (cron: every 15 min)        │           │
-│  │  └─► handleKubitSchedule                            │           │
-│  │        • Query all enabled integrations from PG     │           │
-│  │        • Filter to those due (syncIntervalMinutes   │           │
-│  │          elapsed since lastSyncAt)                  │           │
-│  │        • Enqueue one job per project ───────────────┼──┐        │
-│  │          into KubitIntegrationProcessingQueue       │  │        │
-│  └─────────────────────────────────────────────────────┘  │        │
-│                                                            │        │
-│  ┌─────────────────────────────────────────────────────◄──┘        │
-│  │  KubitIntegrationProcessingQueue  (per-project job) │           │
-│  │  └─► handleKubitProjectJob                          │           │
-│  │        • Load config + decrypt API key from PG      │           │
-│  │        • Stream traces, observations, scores        │           │
-│  │          from ClickHouse (window:                   │           │
-│  │          lastSyncAt → now - sessionOffsetMinutes)   │           │
-│  │        • KubitClient: size-based batching (8 MB)    │           │
-│  │          POST → configured endpoint URL             │           │
-│  │        • On success: update lastSyncAt in PG        │           │
-│  └─────────────────────────────────────────────────────┘           │
-└─────────────────────────────────────────────────────────────────────┘
-                               │
-                               │  HTTPS POST
-                               │  Authorization: Bearer <api_key>
-                               │  { "events": [ { "entity_type": "...", ... } ] }
-                               ▼
-                      Kubit Ingest Endpoint
+│  KubitIntegrationQueue  (cron: every 15 min)                        │
+│  └─► handleKubitSchedule                                            │
+│        • Query all enabled integrations from PostgreSQL             │
+│        • Filter to those due (syncIntervalMinutes elapsed)          │
+│        • Enqueue one job per project                                │
+│                                                                     │
+│  KubitIntegrationProcessingQueue  (per-project job)                 │
+│  └─► handleKubitProjectJob                                          │
+│        • Acquire distributed Redis lock (one worker per project)    │
+│        • Exchange API key for temporary AWS credentials             │
+│        • Determine sync window (pin maxTimestamp for retries)       │
+│        • Run processors concurrently (Promise.allSettled)           │
+│          ├── traces          (TRACES_OBSERVATIONS, T_O_EVENTS)      │
+│          ├── observations    (TRACES_OBSERVATIONS, T_O_EVENTS)      │
+│          ├── scores          (always)                               │
+│          └── enriched events (EVENTS, T_O_EVENTS)                  │
+│        • On success: advance lastSyncAt, clear tracking columns     │
+│        • On failure: save lastError, re-throw for BullMQ retry      │
+└─────────────────────────────────┬───────────────────────────────────┘
+                                  │
+                                  ▼  AWS Kinesis PutRecords (SigV4)
+                     AWS Kinesis Data Stream
 ```
 
 ---
@@ -67,13 +56,27 @@ Creates the `kubit_integrations` table in PostgreSQL. One row per project, keyed
 | Column | Type | Purpose |
 |---|---|---|
 | `project_id` | TEXT PK | Ties the integration to a Langfuse project |
-| `endpoint_url` | TEXT | Where to POST data |
-| `encrypted_api_key` | TEXT | AES-encrypted Bearer token |
+| `endpoint_url` | TEXT | Base URL of the credential exchange endpoint |
+| `encrypted_api_key` | TEXT | AES-encrypted API key |
 | `enabled` | BOOLEAN | Toggle sync on/off without deleting config |
 | `sync_interval_minutes` | INT (default 60) | How often to sync per project |
-| `session_offset_minutes` | INT (default 30) | Lag behind "now" to avoid partial sessions |
-| `request_timeout_seconds` | INT (default 30) | HTTP timeout for each batch request |
-| `last_sync_at` | TIMESTAMP | High-water mark; updated after every successful sync |
+| `request_timeout_seconds` | INT (default 30) | HTTP timeout per Kinesis batch request |
+| `export_source` | TEXT (default `TRACES_OBSERVATIONS`) | Which entity types to export |
+| `encrypted_aws_access_key_id` | TEXT nullable | Cached STS credential |
+| `encrypted_aws_secret_access_key` | TEXT nullable | Cached STS credential |
+| `encrypted_aws_session_token` | TEXT nullable | Cached STS credential |
+| `aws_credentials_expiry` | TIMESTAMP nullable | When the STS credentials expire |
+| `aws_kinesis_stream_name` | TEXT nullable | Kinesis stream name (from credential response) |
+| `aws_kinesis_region` | TEXT nullable | AWS region (from credential response) |
+| `aws_kinesis_partition_key` | TEXT nullable | Workspace-level partition key |
+| `last_sync_at` | TIMESTAMP nullable | High-water mark; advances after each successful sync |
+| `last_error` | TEXT nullable | Last error message; cleared on success |
+| `current_sync_max_timestamp` | TIMESTAMP nullable | Pinned upper bound for the current retry window |
+| `traces_synced_at` | TIMESTAMP nullable | Per-processor completion tracking for retries |
+| `observations_synced_at` | TIMESTAMP nullable | Per-processor completion tracking for retries |
+| `events_synced_at` | TIMESTAMP nullable | Per-processor completion tracking for retries |
+| `scores_synced_at` | TIMESTAMP nullable | Per-processor completion tracking for retries |
+| `created_at` | TIMESTAMP | When the integration was first configured |
 
 ---
 
@@ -92,7 +95,7 @@ Adds corresponding `QueueName` and `QueueJobs` enum values, plus `TQueueJobTypes
 ### `packages/shared/src/server/redis/kubitIntegrationQueue.ts`
 **New file — scheduler queue**
 
-Singleton queue that fires a cron job every 15 minutes (`*/15 * * * *`). The 15-minute cadence is intentionally finer than the default 60-minute sync interval so projects with different `syncIntervalMinutes` are all checked regularly. The actual due-check is done in `handleKubitSchedule`.
+Singleton queue that fires a cron job every 15 minutes (`*/15 * * * *`). The 15-minute cadence is finer than the default 60-minute sync interval so projects with different `syncIntervalMinutes` values are all checked regularly. The actual due-check is done in `handleKubitSchedule`.
 
 ---
 
@@ -102,7 +105,6 @@ Singleton queue that fires a cron job every 15 minutes (`*/15 * * * *`). The 15-
 Singleton queue for per-project sync jobs. Configured with:
 - **5 retry attempts** with exponential backoff (5s base)
 - `removeOnComplete: true` to keep Redis clean
-- `removeOnFail: 100_000` to retain failed jobs for debugging
 
 ---
 
@@ -111,28 +113,34 @@ Singleton queue for per-project sync jobs. Configured with:
 
 Adds one async generator per entity type (`getTracesForKubit`, `getObservationsForKubit`, `getScoresForKubit`). Each:
 - Queries ClickHouse via `queryClickhouseStream` (memory-efficient, no full result set loaded at once)
-- Filters by `project_id`, timestamp window, and `is_deleted = 0`
-- Yields rows tagged with `entity_type` so the downstream client can distinguish them
+- Filters by `project_id`, timestamp window (`minTimestamp` → `maxTimestamp`), and `is_deleted = 0`
+- Yields rows tagged with `entity_type` so the downstream client can route them correctly
+
+---
+
+### `packages/shared/src/server/repositories/events.ts`
+**Modified — adds ClickHouse streaming query for V4 enriched observations**
+
+Adds `getEventsForKubit` — an async generator that streams V4 enriched observations from the events table. Used when `exportSource` is `EVENTS` or `TRACES_OBSERVATIONS_EVENTS`. These records denormalize trace-level fields (userId, sessionId, tags, etc.) directly into each observation row, providing a single enriched record per span.
 
 ---
 
 ### `web/src/features/kubit-integration/types.ts`
 **New file — validation schema**
 
-Defines `kubitIntegrationFormSchema`. Validates all user-configurable fields. Shared between the frontend form and the API router to avoid duplication.
+Defines `kubitIntegrationFormSchema` using Zod v4. Validates all user-configurable fields. Shared between the frontend form and the API router.
 
 ---
 
 ### `web/src/features/kubit-integration/kubit-integration-router.ts`
-**New file — API router**
+**New file — tRPC router**
 
 Three procedures, all behind the `integrations:CRUD` RBAC scope:
 
 | Procedure | What it does |
 |---|---|
-| `get` | Reads integration config for a project. The API key is **never returned** — only metadata. |
-| `update` | Creates or updates the integration. The API key is AES-encrypted before storage using `ENCRYPTION_KEY`. If a row already exists and no new API key is provided, the existing encrypted key is preserved. |
-| `delete` | Deletes the integration row, disabling sync. |
+| `get` | Reads integration config for a project. The API key is **never returned** — only metadata (enabled status, last sync time, last error, export source). |
+| `update` | Creates or updates the integration. The API key is AES-encrypted before storage using `ENCRYPTION_KEY`. If a row already exists and no new API key is provided, the existing encrypted key is preserved. Also clears `lastError` and `lastSyncAt` on update. |
 
 All mutations write an audit log entry.
 
@@ -143,28 +151,20 @@ All mutations write an audit log entry.
 
 Settings page at `/project/[projectId]/settings/integrations/kubit`. Access is restricted to users with the `integrations:CRUD` scope (project admin or owner).
 
-The page has three sections:
+**Configuration form fields:**
 
-**Header**
-- Status badge showing **active** or **inactive** based on the `enabled` flag
+| Field | Default | Constraints | Description |
+|---|---|---|---|
+| Endpoint URL | — | Must be a valid URL | Base URL for the credential exchange endpoint |
+| API Key | — | Required on first save; blank = keep existing | Never pre-filled, never returned by the API |
+| Export Source | `TRACES_OBSERVATIONS` | Enum | Which entity types to export (see below) |
+| Sync Interval | 60 min | 15–1440 | How often to sync per project |
+| Request Timeout | 30 s | 5–300 | Per-request HTTP timeout |
+| Enabled | off | — | Enables/disables sync without deleting config |
 
-**Configuration form**
+**Status section** — shows `lastSyncAt`, `lastError` (if any), and per-processor sync timestamps.
 
-| Field | Type | Default | Constraints | Description |
-|---|---|---|---|---|
-| Endpoint URL | Text | `https://langfuse-ingest.kubit.ai` | Must be a valid URL | The full ingest URL of the Kubit instance |
-| API Key | Password | — | Required on first save; leave blank to keep existing | Bearer token for authenticating with the endpoint. Never pre-filled, never returned by the API. |
-| Sync Interval | Number | 60 | min 15, max 1440 | How often (in minutes) data is synced to Kubit |
-| Session Offset | Number | 30 | min 5, max 120 | How far behind "now" to sync — increase if sessions last longer than 30 minutes |
-| Request Timeout | Number | 30 | min 5, max 300 | Seconds to wait for a response before retrying |
-| Enabled | Toggle | off | — | Enables or disables the sync without deleting the configuration |
-
-**Status section** (shown only when enabled)
-- Displays `lastSyncAt` — the timestamp of the most recently completed sync
-
-**Actions**
-- **Save** — creates or updates the integration
-- **Reset** — deletes the integration row entirely (requires confirmation)
+**Actions** — Save (create/update) and Reset (deletes the row, requires confirmation).
 
 ---
 
@@ -172,68 +172,113 @@ The page has three sections:
 **New file — queue processors**
 
 Wires up two processors:
-- `kubitIntegrationProcessor` → handles `KubitIntegrationJob` → calls `handleKubitSchedule`
-- `kubitIntegrationProcessingProcessor` → handles `KubitIntegrationProcessingJob` → calls `handleKubitProjectJob`, wrapped in an OpenTelemetry span
+- `kubitIntegrationProcessor` → `handleKubitSchedule`
+- `kubitIntegrationProcessingProcessor` → `handleKubitProjectJob`, wrapped in an OpenTelemetry span
 
 ---
 
 ### `worker/src/features/kubit/handleKubitSchedule.ts`
 **New file — scheduler logic**
 
-Runs every 15 minutes. Queries all enabled integrations from PostgreSQL, filters to those where `now - lastSyncAt >= syncIntervalMinutes`, and enqueues one processing job per due project. Jobs are deduplicated by `jobId = ${projectId}-${lastSyncAt}` to prevent double-enqueuing on worker restarts.
+Runs every 15 minutes. Queries all enabled integrations from PostgreSQL, filters to those where `now - lastSyncAt >= syncIntervalMinutes`, and enqueues one processing job per due project.
+
+Jobs are deduplicated by `jobId = "${projectId}-${lastSyncAt?.toISOString()}"` — if the scheduler fires twice before a sync completes, the second enqueue is a no-op.
 
 ---
 
 ### `worker/src/features/kubit/handleKubitProjectJob.ts`
 **New file — per-project sync logic**
 
-Streams all three entity types concurrently:
+The main job handler. Key behaviours:
 
-1. `processKubitTraces` — streams traces from ClickHouse, feeds into `KubitClient`
-2. `processKubitObservations` — same for observations
-3. `processKubitScores` — same for scores
+**Distributed locking** — A Redis lock (`kubit:lock:{projectId}`, TTL 4 hours) ensures only one worker processes a given project at a time. If the lock is held by another worker the job exits immediately.
 
-Each processor calls `client.flush()` every 1,000 events for memory management (the client itself handles HTTP-level batching). On success, updates `lastSyncAt` in PostgreSQL. On failure, the error is re-thrown so the queue retries the full job.
+**Credential management** — AWS STS credentials are cached encrypted in PostgreSQL. Before each sync, the handler checks expiry (with a 5-minute buffer). If expired or missing, it calls `{endpointUrl}/token` with the API key to obtain fresh credentials. On 401/403, the integration is permanently disabled. On 5xx, the job throws so BullMQ retries.
+
+**Sync window pinning** — On the first attempt, `maxTimestamp = now` is persisted as `currentSyncMaxTimestamp`. Retries reuse the same pinned timestamp, preventing the window from drifting between attempts.
+
+**Per-processor skip on retry** — After each processor completes, its `{entity}SyncedAt` column is written. On retry, processors whose `syncedAt >= maxTimestamp` are skipped, preventing duplicate sends.
+
+**Export source routing** — Which processors run depends on the `exportSource` setting:
+
+| `exportSource` | Processors |
+|---|---|
+| `TRACES_OBSERVATIONS` | traces, observations, scores |
+| `TRACES_OBSERVATIONS_EVENTS` | traces, observations, scores, enriched events |
+| `EVENTS` | enriched events, scores |
+
+**allSettled behaviour** — All processors run to completion via `Promise.allSettled` before any error is thrown. This prevents lingering processors from one job run overlapping with the next retry.
+
+**Error recording** — On failure, the error message is saved to `lastError` in PostgreSQL so it is visible in the settings UI.
 
 ---
 
 ### `worker/src/features/kubit/kubitClient.ts`
-**New file — HTTP client with size-based batching**
+**New file — Kinesis PutRecords client**
 
-The core client that handles sending events to the ingest endpoint.
+Sends enriched events to AWS Kinesis using the SigV4-signed PutRecords API directly via `fetch` (no AWS SDK dependency).
 
-**Key design decision — size-based batching:**
+**Record structure:**
+- `Data`: base64-encoded JSON of the event enriched with `wid` (workspace ID, used for stream partitioning)
+- `PartitionKey`: `{workspaceId}/{event.id}`
 
-A fixed row count per batch is unreliable because traces and observations include `input`/`output` fields that vary hugely in size (from a few bytes to hundreds of kilobytes for long LLM conversations). A naive limit of 1,000 rows can produce payloads that exceed the endpoint's maximum accepted size.
+**Batch splitting** — Each `flush()` call splits the in-memory buffer into PutRecords chunks, each respecting:
+- ≤ 250 records per call (Kinesis hard limit)
+- ≤ 5 MB total per call (Kinesis hard limit)
 
-Instead, the client measures each event's serialized byte size and splits the batch whenever adding the next event would push the total over **8 MB**. This adapts automatically to the actual content:
-- Small events (e.g. scores ~200 B) → many events per request
-- Large events (e.g. traces with large input/output) → fewer events per request
+**`shouldFlush()`** — Returns `true` when the in-memory buffer reaches 25 MB, signalling the caller to flush early and bound peak memory usage during large historical syncs.
 
-Additional features:
-- **3 retries** with exponential backoff (1s, 2s, 4s) per individual batch
-- `AbortController` per request to enforce the configured timeout
-- `Authorization: Bearer <key>` header on every request
+**Partial failure retry** — When `FailedRecordCount > 0`, only the failed records are retried (up to 5 attempts, 1s/2s/4s/8s/16s backoff).
+
+**HTTP error retry** — `sendChunkWithRetry` retries the full chunk on non-2xx responses (up to 5 attempts, 5s/10s/20s/40s/80s + ±25% jitter to avoid thundering herd across parallel processors).
 
 ---
 
+### `worker/src/__tests__/handleKubitProjectJob.test.ts`
+**New file — 38 unit tests**
+
+All mocks are hoisted via `vi.hoisted`. Prisma, ClickHouse generators, global `fetch`, and the `RedisLock` class are fully mocked so tests run without any infrastructure.
+
+| Group | Tests | What is verified |
+|---|---|---|
+| **Early exits** | 4 | No integration → returns immediately, never acquires lock. Lock held → returns immediately, never calls processors, never releases lock. Redis unavailable (skipped) → proceeds without lock. 401 → disables integration, returns cleanly. |
+| **Lock lifecycle** | 3 | Released after success. Released even when a processor throws (finally block). Lock key is `kubit:lock:{projectId}`. |
+| **Sync window** | 3 | `currentSyncMaxTimestamp` is written on first attempt. Existing value is reused on retry (no new write). Pinned timestamp is passed to all processor functions. |
+| **Per-processor skip** | 5 | Each of traces/observations/scores/events is individually skipped when `syncedAt >= maxTimestamp`. All four skipped → final cleanup still runs. `syncedAt` from a previous window is not treated as done. |
+| **Success path** | 3 | Each processor's `syncedAt` is written individually as it completes. `lastSyncAt` advances to `maxTimestamp`. All tracking columns (`currentSyncMaxTimestamp`, all `syncedAt`, `lastError`) are cleared to `null`. |
+| **Failure path** | 5 | Job re-throws so BullMQ retries. Successful processors are marked done; failed processor is not. `lastSyncAt` is not advanced. `lastError` is written with the error message. All processors run to completion before throwing (allSettled). |
+| **Credential refresh** | 4 | Expired credentials trigger a token exchange. Valid credentials skip the exchange. Credentials expiring within 5 minutes are refreshed (buffer window). 403 disables integration without throwing. 500 throws without disabling (retryable). |
+| **Sync cursor** | 2 | `lastSyncAt` is used as `minTimestamp` when set. Falls back to `2000-01-01` on first ever sync. |
+| **Export source routing** | 8 | `TRACES_OBSERVATIONS` runs traces/observations/scores, not events. `EVENTS` runs events/scores only. `TRACES_OBSERVATIONS_EVENTS` runs all four. Correct timestamps passed to `getEventsForKubit`. `eventsSyncedAt` is written, respected for skip, and cleared on success. Events failure in `T_O_EVENTS` mode does not prevent other processors from completing. |
+
 ### `worker/src/__tests__/kubitClient.test.ts`
-**New file — unit tests**
+**New file — 19 unit tests**
 
-Tests for `KubitClient` using a mocked `fetch`:
+Uses `vi.stubGlobal("fetch", ...)` to intercept Kinesis PutRecords calls. Fake timers (`vi.useFakeTimers()`) are used for retry backoff tests to keep the suite fast.
 
-| Test | Verifies |
-|---|---|
-| Single batch under 8 MB | Small events stay in one request |
-| Split into multiple batches | 20 × 1 MB events → 3+ requests, each ≤ 8 MB |
-| Authorization header | `Bearer <key>` is sent correctly |
-| Empty flush | No HTTP requests when batch is empty |
-| Batch cleared after flush | `getBatchSize()` returns 0 post-flush |
+| Group | Tests | What is verified |
+|---|---|---|
+| **Record structure** | 6 | One fetch call per flush for a small batch. Required headers present (`X-Amz-Target`, `Content-Type`, `Authorization`, `X-Amz-Security-Token`). `Data` field is base64-encoded JSON of the event enriched with `wid`. `wid` is present on every record. `PartitionKey` is `{workspaceId}/{event.id}` for events with a string id. UUID fallback for events with no id, numeric id, or empty string id. |
+| **Batch splitting** | 2 | 1100 events → at least 5 PutRecords calls, each ≤ 250 records, total 1100. 10 × ~600 KB events → at least 2 calls due to 5 MB limit. |
+| **shouldFlush / flush** | 3 | Empty flush is a no-op. Batch is cleared after flush. `shouldFlush` returns false below 25 MB, true once threshold is crossed. |
+| **Partial failure retry** | 3 | After a partial failure, only failed records are retried. Succeeds when failures resolve within 5-attempt budget. Throws with "records failed after" after exhausting all 25 total attempts (5 outer × 5 inner). |
+| **HTTP error retry** | 3 | Throws with the HTTP status code on non-2xx response. Retries and resolves when Kinesis recovers on the second attempt. Throws after exhausting all 5 outer retry attempts. |
+| **destroy** | 2 | Resolves without throwing. Does not flush buffered events. |
 
-Run with:
+Run all kubit tests:
 ```bash
-pnpm run test --filter=worker -- kubitClient.test.ts
+pnpm run test --filter=worker -- handleKubitProjectJob
+pnpm run test --filter=worker -- kubitClient
 ```
+
+### Coverage
+
+| File | Statements | Branches | Functions | Lines |
+|---|---|---|---|---|
+| `kubitClient.ts` | 100% | 98% | 100% | 100% |
+| `handleKubitProjectJob.ts` | 88% | 93% | 97% | 88% |
+
+The uncovered 12% of `handleKubitProjectJob.ts` consists of OpenTelemetry span attribute calls (only execute when a tracing span is active, which is not set up in unit tests) and logging statements inside retry loops.
 
 ---
 
@@ -247,45 +292,52 @@ handleKubitSchedule
     │ reads enabled integrations from PostgreSQL
     │ filters to those due (syncIntervalMinutes elapsed since lastSyncAt)
     │
-    ▼ one job per due project
+    ▼  one job per due project
 handleKubitProjectJob
-    │ reads config + decrypts API key from PostgreSQL
     │
-    ├──► getTracesForKubit(projectId, minTs, maxTs)        ← ClickHouse stream
-    ├──► getObservationsForKubit(projectId, minTs, maxTs)  ← ClickHouse stream
-    └──► getScoresForKubit(projectId, minTs, maxTs)        ← ClickHouse stream
-              │ (all three run concurrently)
-              ▼
-         KubitClient.addEvent(...)
-         KubitClient.flush()  ← every 1,000 events + end of stream
-              │
-              │ size-based chunking (split at 8 MB)
-              ▼
-         POST <endpoint_url>
-         Authorization: Bearer <decrypted_key>
-         { "events": [ { "entity_type": "trace"|"observation"|"score", ... } ] }
+    ├── acquire Redis lock (kubit:lock:{projectId})
     │
-    ▼ on success
-update kubit_integrations.last_sync_at = maxTimestamp
+    ├── exchange API key → temporary AWS credentials (cached in PostgreSQL)
+    │
+    ├── pin maxTimestamp = now (persisted for retry idempotency)
+    │
+    ├── (concurrent, Promise.allSettled)
+    │   ├── getTracesForKubit(projectId, minTs, maxTs)        ← ClickHouse stream
+    │   ├── getObservationsForKubit(projectId, minTs, maxTs)  ← ClickHouse stream
+    │   ├── getScoresForKubit(projectId, minTs, maxTs)        ← ClickHouse stream
+    │   └── getEventsForKubit(projectId, minTs, maxTs)        ← ClickHouse stream
+    │         │ (which run depends on exportSource)
+    │         ▼
+    │    KubitClient.addEvent(event)   — enriches with wid
+    │    KubitClient.flush()           — called every 25 MB + end of stream
+    │         │
+    │         │  SigV4-signed PutRecords
+    │         │  ≤ 250 records / ≤ 5 MB per call
+    │         ▼
+    │    AWS Kinesis Data Stream
+    │
+    └── on success: lastSyncAt = maxTimestamp, clear tracking columns
+        on failure: lastError = message, re-throw for BullMQ retry
 ```
 
 ---
 
-## Configuration Reference
+## Export Source Modes
 
-| Setting | Default | Min | Max | Description |
-|---|---|---|---|---|
-| Endpoint URL | `https://langfuse-ingest.kubit.ai` | — | — | Ingest endpoint URL |
-| API Key | — | — | — | Bearer token, AES-encrypted at rest |
-| Sync Interval | 60 min | 15 | 1440 | How often to sync per project |
-| Session Offset | 30 min | 5 | 120 | Lag behind now (avoids partial in-flight sessions) |
-| Request Timeout | 30 s | 5 | 300 | Per-request HTTP timeout |
+| Value | Processors that run |
+|---|---|
+| `TRACES_OBSERVATIONS` (default) | traces, observations, scores |
+| `TRACES_OBSERVATIONS_EVENTS` | traces, observations, scores, enriched events |
+| `EVENTS` | enriched events, scores |
+
+Enriched events (`EVENTS` mode) come from the V4 events table and include denormalized trace-level fields per observation record.
 
 ---
 
 ## Security Notes
 
-- The API key is **never stored in plaintext**. It is encrypted with AES using Langfuse's existing `ENCRYPTION_KEY` environment variable before being written to PostgreSQL, and decrypted only in the worker at sync time.
-- The API key is **never returned** by the `get` API procedure — only metadata is exposed to the frontend.
+- The API key is **never stored in plaintext**. It is AES-encrypted using Langfuse's existing `ENCRYPTION_KEY` environment variable before being written to PostgreSQL, and decrypted only in the worker at sync time.
+- AWS STS credentials returned by the token endpoint are also stored encrypted.
+- The API key is **never returned** by the `get` tRPC procedure — only metadata is exposed to the frontend.
 - All CRUD operations require the `integrations:CRUD` RBAC scope (project admin or owner).
 - All mutations are recorded in the Langfuse audit log.

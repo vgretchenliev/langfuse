@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { KubitClient } from "../features/kubit/kubitClient";
 
 const PROJECT_ID = "project-abc-123";
@@ -68,8 +68,96 @@ function mockFetchOk(): FetchCall[] {
   return calls;
 }
 
+// ── Partial / HTTP failure helpers ───────────────────────────────────────────
+
+/**
+ * Stubs fetch so the first `failCount` calls return a full partial failure
+ * (all records have ErrorCode), then subsequent calls succeed.
+ */
+function mockFetchPartialFailureThenSuccess(failCount: number): void {
+  let callCount = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_url: string, init: RequestInit) => {
+      callCount++;
+      const parsed = JSON.parse(init.body as string) as {
+        Records: unknown[];
+      };
+      const count = parsed.Records.length;
+
+      if (callCount <= failCount) {
+        return {
+          ok: true,
+          text: async () => "",
+          json: async () => ({
+            FailedRecordCount: count,
+            Records: parsed.Records.map(() => ({
+              ErrorCode: "ProvisionedThroughputExceededException",
+              ErrorMessage: "Rate exceeded for shard",
+            })),
+          }),
+        } as unknown as Response;
+      }
+
+      return {
+        ok: true,
+        text: async () => "",
+        json: async () => ({
+          FailedRecordCount: 0,
+          Records: parsed.Records.map(() => ({
+            SequenceNumber:
+              "49640338859349934440025507667573645222572899765701713922",
+            ShardId: "shardId-000000000000",
+          })),
+        }),
+      } as unknown as Response;
+    }),
+  );
+}
+
+/** Stubs fetch so every call returns a full partial failure. */
+function mockFetchAlwaysFail(): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_url: string, init: RequestInit) => {
+      const parsed = JSON.parse(init.body as string) as { Records: unknown[] };
+      return {
+        ok: true,
+        text: async () => "",
+        json: async () => ({
+          FailedRecordCount: parsed.Records.length,
+          Records: parsed.Records.map(() => ({
+            ErrorCode: "InternalFailure",
+            ErrorMessage: "Internal service error",
+          })),
+        }),
+      } as unknown as Response;
+    }),
+  );
+}
+
+/** Stubs fetch so every call returns a non-2xx HTTP error. */
+function mockFetchHttpError(status = 400): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => ({
+      ok: false,
+      status,
+      statusText: "Bad Request",
+      text: async () => "ResourceNotFoundException",
+    })),
+  );
+}
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
+
 beforeEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("KubitClient — Kinesis PutRecords via REST", () => {
@@ -251,5 +339,162 @@ describe("KubitClient — Kinesis PutRecords via REST", () => {
       });
     }
     expect(client.shouldFlush()).toBe(true);
+  });
+});
+
+// ── Partial failure retry ─────────────────────────────────────────────────────
+
+describe("KubitClient — partial failure retry", () => {
+  it("retries only the failed records after a partial failure", async () => {
+    vi.useFakeTimers();
+
+    // First call: both records fail. Second call: both succeed.
+    mockFetchPartialFailureThenSuccess(1);
+    const client = makeClient();
+
+    client.addEvent({ entity_type: "trace", id: "t1" });
+    client.addEvent({ entity_type: "trace", id: "t2" });
+
+    const flushPromise = client.flush();
+    await vi.runAllTimersAsync();
+    await flushPromise;
+
+    // fetch was called twice — initial attempt + one retry
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(2);
+
+    // Both calls sent 2 records (first all failed, second retried all 2)
+    for (const call of vi.mocked(globalThis.fetch).mock.calls) {
+      const body = JSON.parse((call[1] as RequestInit).body as string) as {
+        Records: unknown[];
+      };
+      expect(body.Records).toHaveLength(2);
+    }
+  });
+
+  it("succeeds when partial failures resolve within the retry budget", async () => {
+    vi.useFakeTimers();
+
+    // Fail 3 times, succeed on the 4th — still within MAX_RETRIES=5
+    mockFetchPartialFailureThenSuccess(3);
+    const client = makeClient();
+    client.addEvent({ entity_type: "score", id: "s1" });
+
+    const flushPromise = client.flush();
+    await vi.runAllTimersAsync();
+
+    await expect(flushPromise).resolves.toBeUndefined();
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(4);
+  });
+
+  it("throws after exhausting all partial-failure retry attempts", async () => {
+    vi.useFakeTimers();
+
+    mockFetchAlwaysFail();
+    const client = makeClient();
+    client.addEvent({ entity_type: "trace", id: "t1" });
+
+    const flushPromise = client.flush();
+    await vi.runAllTimersAsync();
+
+    await expect(flushPromise).rejects.toThrow(/records failed after/);
+
+    // Two nested retry loops: putRecords (5×) inside sendChunkWithRetry (5×) = 25 total calls
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(25);
+  });
+});
+
+// ── HTTP error handling ───────────────────────────────────────────────────────
+
+describe("KubitClient — HTTP error handling", () => {
+  it("throws on a non-2xx response and includes the status code", async () => {
+    vi.useFakeTimers();
+
+    mockFetchHttpError(400);
+    const client = makeClient();
+    client.addEvent({ entity_type: "trace", id: "t1" });
+
+    const flushPromise = client.flush();
+    await vi.runAllTimersAsync();
+
+    await expect(flushPromise).rejects.toThrow(/400/);
+  });
+
+  it("retries on HTTP error and resolves when Kinesis recovers", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        callCount++;
+        if (callCount === 1) {
+          return {
+            ok: false,
+            status: 500,
+            statusText: "Internal Server Error",
+            text: async () => "ServiceUnavailableException",
+          } as unknown as Response;
+        }
+        const parsed = JSON.parse(init.body as string) as {
+          Records: unknown[];
+        };
+        return {
+          ok: true,
+          text: async () => "",
+          json: async () => ({
+            FailedRecordCount: 0,
+            Records: parsed.Records.map(() => ({
+              SequenceNumber: "seq-0",
+              ShardId: "shardId-000000000000",
+            })),
+          }),
+        } as unknown as Response;
+      }),
+    );
+
+    const client = makeClient();
+    client.addEvent({ entity_type: "trace", id: "t1" });
+
+    const flushPromise = client.flush();
+    await vi.runAllTimersAsync();
+
+    await expect(flushPromise).resolves.toBeUndefined();
+    expect(callCount).toBe(2);
+  });
+
+  it("throws after exhausting all HTTP error retries", async () => {
+    vi.useFakeTimers();
+
+    mockFetchHttpError(503);
+    const client = makeClient();
+    client.addEvent({ entity_type: "trace", id: "t1" });
+
+    const flushPromise = client.flush();
+    // Attach the assertion before advancing timers to avoid unhandled rejection
+    const assertion = expect(flushPromise).rejects.toThrow(/503/);
+    await vi.runAllTimersAsync();
+    await assertion;
+
+    // sendChunkWithRetry retries MAX_RETRIES=5 times
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(5);
+  });
+});
+
+// ── destroy ───────────────────────────────────────────────────────────────────
+
+describe("KubitClient — destroy", () => {
+  it("resolves without throwing", async () => {
+    const client = makeClient();
+    await expect(client.destroy()).resolves.toBeUndefined();
+  });
+
+  it("does not flush remaining buffered events on destroy", async () => {
+    mockFetchOk();
+    const client = makeClient();
+    client.addEvent({ entity_type: "trace", id: "t1" });
+
+    await client.destroy();
+
+    expect(vi.mocked(globalThis.fetch)).not.toHaveBeenCalled();
   });
 });
