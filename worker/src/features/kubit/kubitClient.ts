@@ -13,9 +13,9 @@ const MAX_RETRIES = 5;
 // large historical syncs.
 const FLUSH_THRESHOLD_BYTES = 25 * 1024 * 1024; // 25 MB
 
-// One PutRecords call at a time per processor — 3 processors run in parallel
-// so the total in-flight is 3 × 1 = 3 concurrent calls (3,000 records/burst
-// across 12 shards = 250 records/shard). Higher concurrency causes thundering
+// One PutRecords call at a time per processor — up to 4 processors run in
+// parallel (traces + observations + scores + enriched observations), so total
+// in-flight is at most 4 concurrent calls. Higher concurrency causes thundering
 // herd during backfills: retries from failed batches overlap with new batches
 // and compound the throttling.
 const PUT_RECORDS_CONCURRENCY = 1;
@@ -184,11 +184,10 @@ export class KubitClient {
     if (this.batch.length === 0) return;
 
     // Split buffered events into PutRecords calls, each respecting:
-    //   • ≤ 500 records per call (Kinesis hard limit)
+    //   • ≤ 250 records per call (configured limit, below Kinesis hard limit of 500)
     //   • ≤ 5 MB total per call (Kinesis hard limit)
-    //   • ≤ 1 MB per individual record (Kinesis hard limit)
     // Each Kinesis record carries exactly one enriched event as a
-    // base64-encoded JSON string, keeping the format compatible with
+    // base64-encoded JSON string.
     const calls: KubitEvent[][] = [];
     let currentCall: KubitEvent[] = [];
     let currentCallBytes = 0;

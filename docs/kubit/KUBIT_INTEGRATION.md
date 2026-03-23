@@ -141,8 +141,9 @@ Three procedures, all behind the `integrations:CRUD` RBAC scope:
 |---|---|
 | `get` | Reads integration config for a project. The API key is **never returned** — only metadata (enabled status, last sync time, last error, export source). |
 | `update` | Creates or updates the integration. The API key is AES-encrypted before storage using `ENCRYPTION_KEY`. If a row already exists and no new API key is provided, the existing encrypted key is preserved. Also clears `lastError` and `lastSyncAt` on update. |
+| `delete` | Deletes the integration row entirely, disabling all future syncs. |
 
-All mutations write an audit log entry.
+All mutations (`update`, `delete`) write an audit log entry.
 
 ---
 
