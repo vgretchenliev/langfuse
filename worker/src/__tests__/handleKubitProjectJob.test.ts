@@ -33,6 +33,7 @@ vi.mock("@langfuse/shared/src/server", () => ({
   getTracesForKubit: vi.fn(),
   getObservationsForKubit: vi.fn(),
   getScoresForKubit: vi.fn(),
+  getEventsForKubit: vi.fn(),
   QueueName: {
     KubitIntegrationProcessingQueue: "KubitIntegrationProcessingQueue",
   },
@@ -58,6 +59,7 @@ import {
   getTracesForKubit,
   getObservationsForKubit,
   getScoresForKubit,
+  getEventsForKubit,
 } from "@langfuse/shared/src/server";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -180,6 +182,7 @@ beforeEach(() => {
   vi.mocked(getTracesForKubit).mockReturnValue(makeGenerator());
   vi.mocked(getObservationsForKubit).mockReturnValue(makeGenerator());
   vi.mocked(getScoresForKubit).mockReturnValue(makeGenerator());
+  vi.mocked(getEventsForKubit).mockReturnValue(makeGenerator());
 
   // Default: all prisma calls succeed
   vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
