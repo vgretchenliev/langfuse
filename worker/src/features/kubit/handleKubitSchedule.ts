@@ -23,11 +23,17 @@ export const handleKubitSchedule = async () => {
     return;
   }
 
-  // Only enqueue projects whose sync interval has elapsed since lastSyncAt
+  // Only enqueue projects whose sync interval has elapsed since lastSyncAt.
+  // A 60-second grace period absorbs cron jitter: the cron fires every 15 min
+  // so it can land up to ~15 min early or late relative to the exact due time.
+  // Without the grace period, a tick that fires a few seconds early would skip
+  // an integration that is effectively due, delaying it by a full 15 minutes.
+  const GRACE_PERIOD_MS = 60 * 1000;
   const due = integrations.filter(({ lastSyncAt, syncIntervalMinutes }) => {
     if (!lastSyncAt) return true; // never synced — always due
     return (
-      now.getTime() - lastSyncAt.getTime() >= syncIntervalMinutes * 60 * 1000
+      now.getTime() - lastSyncAt.getTime() >=
+      syncIntervalMinutes * 60 * 1000 - GRACE_PERIOD_MS
     );
   });
 
