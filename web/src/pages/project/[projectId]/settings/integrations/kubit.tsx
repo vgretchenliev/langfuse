@@ -19,8 +19,6 @@ import { PasswordInput } from "@/src/components/ui/password-input";
 import { Switch } from "@/src/components/ui/switch";
 import { Card } from "@/src/components/ui/card";
 import { kubitIntegrationFormSchema } from "@/src/features/kubit-integration/types";
-import { EXPORT_SOURCE_OPTIONS } from "@langfuse/shared";
-import { useV4Beta } from "@/src/features/events/hooks/useV4Beta";
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { api } from "@/src/utils/api";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -28,19 +26,6 @@ import { useRouter } from "next/router";
 import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { type z } from "zod/v4";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/src/components/ui/select";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/src/components/ui/tooltip";
-import { Info } from "lucide-react";
 
 const DEFAULT_ENDPOINT_URL = "https://langfuse-ingest.kubit.ai";
 
@@ -152,15 +137,12 @@ const KubitIntegrationSettingsForm = ({
     enabled: boolean;
     syncIntervalMinutes: number;
     requestTimeoutSeconds: number;
-    exportSource?: string | null;
     lastSyncAt?: Date | null;
     lastError?: string | null;
   } | null;
   projectId: string;
   isLoading: boolean;
 }) => {
-  const { isBetaEnabled } = useV4Beta();
-
   const kubitForm = useForm({
     resolver: zodResolver(kubitIntegrationFormSchema),
     defaultValues: {
@@ -169,11 +151,6 @@ const KubitIntegrationSettingsForm = ({
       enabled: state?.enabled ?? false,
       syncIntervalMinutes: state?.syncIntervalMinutes ?? 60,
       requestTimeoutSeconds: state?.requestTimeoutSeconds ?? 30,
-      exportSource:
-        (state?.exportSource as z.infer<
-          typeof kubitIntegrationFormSchema
-        >["exportSource"]) ??
-        (isBetaEnabled ? "EVENTS" : "TRACES_OBSERVATIONS"),
     },
     disabled: isLoading,
   });
@@ -185,11 +162,6 @@ const KubitIntegrationSettingsForm = ({
       enabled: state?.enabled ?? false,
       syncIntervalMinutes: state?.syncIntervalMinutes ?? 60,
       requestTimeoutSeconds: state?.requestTimeoutSeconds ?? 30,
-      exportSource:
-        (state?.exportSource as z.infer<
-          typeof kubitIntegrationFormSchema
-        >["exportSource"]) ??
-        (isBetaEnabled ? "EVENTS" : "TRACES_OBSERVATIONS"),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
@@ -297,46 +269,6 @@ const KubitIntegrationSettingsForm = ({
             </FormItem>
           )}
         />
-        {isBetaEnabled && (
-          <FormField
-            control={kubitForm.control}
-            name="exportSource"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel className="flex items-center gap-1">
-                  Export Source
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Info className="h-3 w-3 cursor-help text-muted-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-xs">
-                      {
-                        EXPORT_SOURCE_OPTIONS.find(
-                          (o) => o.value === field.value,
-                        )?.description
-                      }
-                    </TooltipContent>
-                  </Tooltip>
-                </FormLabel>
-                <Select onValueChange={field.onChange} value={field.value}>
-                  <FormControl>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                  </FormControl>
-                  <SelectContent>
-                    {EXPORT_SOURCE_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>
-                        {option.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
-        )}
         <FormField
           control={kubitForm.control}
           name="enabled"

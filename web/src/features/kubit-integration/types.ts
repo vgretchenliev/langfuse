@@ -1,4 +1,3 @@
-import { AnalyticsIntegrationExportSource } from "@langfuse/shared";
 import { z } from "zod/v4";
 
 export const kubitIntegrationFormSchema = z.object({
@@ -7,7 +6,4 @@ export const kubitIntegrationFormSchema = z.object({
   enabled: z.boolean(),
   syncIntervalMinutes: z.number().int().min(15).max(1440),
   requestTimeoutSeconds: z.number().int().min(5).max(300),
-  exportSource: z
-    .enum(AnalyticsIntegrationExportSource)
-    .default(AnalyticsIntegrationExportSource.TRACES_OBSERVATIONS),
 });

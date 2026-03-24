@@ -16,7 +16,6 @@ CREATE TABLE "kubit_integrations" (
     "last_sync_at" TIMESTAMP(3),
     "last_error" TEXT,
     "current_sync_max_timestamp" TIMESTAMP(3),
-    "export_source" TEXT NOT NULL DEFAULT 'TRACES_OBSERVATIONS',
     "traces_synced_at" TIMESTAMP(3),
     "observations_synced_at" TIMESTAMP(3),
     "events_synced_at" TIMESTAMP(3),

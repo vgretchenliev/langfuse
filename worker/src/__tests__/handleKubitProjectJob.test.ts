@@ -6,9 +6,12 @@ import type { QueueName, TQueueJobTypes } from "@langfuse/shared/src/server";
 // vi.mock factories are hoisted before imports, so any values they close over
 // must be created with vi.hoisted to be available at factory evaluation time.
 
-const { mockAcquire, mockRelease } = vi.hoisted(() => ({
+const { mockAcquire, mockRelease, mockEnv } = vi.hoisted(() => ({
   mockAcquire: vi.fn<[], Promise<"acquired" | "held_by_other" | "skipped">>(),
   mockRelease: vi.fn<[], Promise<boolean>>(),
+  mockEnv: {
+    LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE: "false" as "true" | "false",
+  },
 }));
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -50,6 +53,8 @@ vi.mock("../utils/RedisLock", () => ({
     release: mockRelease,
   })),
 }));
+
+vi.mock("../env", () => ({ env: mockEnv }));
 
 // ── Imports (resolved after mocks are registered) ─────────────────────────────
 
@@ -97,7 +102,6 @@ function makeIntegration(
     observationsSyncedAt: null,
     eventsSyncedAt: null,
     scoresSyncedAt: null,
-    exportSource: "TRACES_OBSERVATIONS",
     createdAt: new Date(),
     ...overrides,
   };
@@ -194,6 +198,9 @@ beforeEach(() => {
   );
 
   stubFetch();
+
+  // Default: V4 pipeline disabled (legacy mode)
+  mockEnv.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE = "false";
 });
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -707,11 +714,11 @@ describe("handleKubitProjectJob", () => {
     });
   });
 
-  // ── Export source routing ─────────────────────────────────────────────────────
+  // ── Pipeline mode routing ─────────────────────────────────────────────────────
 
-  describe("export source routing", () => {
-    it("TRACES_OBSERVATIONS: calls traces, observations, scores — not events", async () => {
-      // Default exportSource in makeIntegration is TRACES_OBSERVATIONS
+  describe("pipeline mode routing", () => {
+    it("legacy mode (V4 disabled): calls traces, observations, scores — not events", async () => {
+      // mockEnv defaults to LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE = "false"
       await handleKubitProjectJob(makeJob());
 
       expect(getTracesForKubit).toHaveBeenCalled();
@@ -720,10 +727,8 @@ describe("handleKubitProjectJob", () => {
       expect(getEventsForKubit).not.toHaveBeenCalled();
     });
 
-    it("EVENTS: calls events and scores — not traces or observations", async () => {
-      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
-        makeIntegration({ exportSource: "EVENTS" }) as never,
-      );
+    it("V4 mode (env enabled): calls events and scores — not traces or observations", async () => {
+      mockEnv.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE = "true";
 
       await handleKubitProjectJob(makeJob());
 
@@ -733,27 +738,12 @@ describe("handleKubitProjectJob", () => {
       expect(getObservationsForKubit).not.toHaveBeenCalled();
     });
 
-    it("TRACES_OBSERVATIONS_EVENTS: calls all four processors", async () => {
-      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
-        makeIntegration({
-          exportSource: "TRACES_OBSERVATIONS_EVENTS",
-        }) as never,
-      );
-
-      await handleKubitProjectJob(makeJob());
-
-      expect(getTracesForKubit).toHaveBeenCalled();
-      expect(getObservationsForKubit).toHaveBeenCalled();
-      expect(getScoresForKubit).toHaveBeenCalled();
-      expect(getEventsForKubit).toHaveBeenCalled();
-    });
-
-    it("EVENTS: passes the correct timestamps to getEventsForKubit", async () => {
+    it("V4 mode: passes the correct timestamps to getEventsForKubit", async () => {
+      mockEnv.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE = "true";
       const pinnedTs = new Date("2026-01-01T10:00:00.000Z");
       const lastSync = new Date("2026-01-01T08:00:00.000Z");
       vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
         makeIntegration({
-          exportSource: "EVENTS",
           currentSyncMaxTimestamp: pinnedTs,
           lastSyncAt: lastSync,
         }) as never,
@@ -768,10 +758,8 @@ describe("handleKubitProjectJob", () => {
       );
     });
 
-    it("EVENTS: marks eventsSyncedAt after completion", async () => {
-      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
-        makeIntegration({ exportSource: "EVENTS" }) as never,
-      );
+    it("V4 mode: marks eventsSyncedAt after completion", async () => {
+      mockEnv.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE = "true";
 
       await handleKubitProjectJob(makeJob());
 
@@ -784,11 +772,11 @@ describe("handleKubitProjectJob", () => {
       expect(eventsUpdate).toBeDefined();
     });
 
-    it("EVENTS: skips events when eventsSyncedAt >= currentSyncMaxTimestamp", async () => {
+    it("V4 mode: skips events when eventsSyncedAt >= currentSyncMaxTimestamp", async () => {
+      mockEnv.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE = "true";
       const ts = new Date("2026-01-01T10:00:00.000Z");
       vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
         makeIntegration({
-          exportSource: "EVENTS",
           currentSyncMaxTimestamp: ts,
           eventsSyncedAt: ts,
         }) as never,
@@ -800,10 +788,8 @@ describe("handleKubitProjectJob", () => {
       expect(getScoresForKubit).toHaveBeenCalled();
     });
 
-    it("EVENTS: clears eventsSyncedAt in final cleanup", async () => {
-      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
-        makeIntegration({ exportSource: "EVENTS" }) as never,
-      );
+    it("V4 mode: clears eventsSyncedAt in final cleanup", async () => {
+      mockEnv.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE = "true";
 
       await handleKubitProjectJob(makeJob());
 
@@ -816,12 +802,8 @@ describe("handleKubitProjectJob", () => {
       expect(data.eventsSyncedAt).toBeNull();
     });
 
-    it("TRACES_OBSERVATIONS_EVENTS: events failure does not prevent traces/observations/scores from completing", async () => {
-      vi.mocked(prisma.kubitIntegration.findFirst).mockResolvedValue(
-        makeIntegration({
-          exportSource: "TRACES_OBSERVATIONS_EVENTS",
-        }) as never,
-      );
+    it("V4 mode: events failure does not prevent scores from completing", async () => {
+      mockEnv.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE = "true";
       vi.mocked(getEventsForKubit).mockReturnValue(
         throwingGenerator("events table unavailable"),
       );
@@ -849,9 +831,7 @@ describe("handleKubitProjectJob", () => {
         ),
       ).toBe(false);
 
-      // The rest completed and ARE marked done
-      expect(hasSyncedAt("tracesSyncedAt")).toBe(true);
-      expect(hasSyncedAt("observationsSyncedAt")).toBe(true);
+      // Scores completed and IS marked done
       expect(hasSyncedAt("scoresSyncedAt")).toBe(true);
     });
   });

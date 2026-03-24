@@ -1099,7 +1099,6 @@ model KubitIntegration {
   enabled               Boolean
   syncIntervalMinutes   Int       @default(60) @map("sync_interval_minutes")
   requestTimeoutSeconds Int       @default(30) @map("request_timeout_seconds")
-  exportSource          AnalyticsIntegrationExportSource @default(TRACES_OBSERVATIONS) @map("export_source")
   encryptedAwsAccessKeyId     String?   @map("encrypted_aws_access_key_id")
   encryptedAwsSecretAccessKey String?   @map("encrypted_aws_secret_access_key")
   encryptedAwsSessionToken    String?   @map("encrypted_aws_session_token")

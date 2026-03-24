@@ -13,6 +13,7 @@ import { prisma } from "@langfuse/shared/src/db";
 import { decrypt, encrypt } from "@langfuse/shared/encryption";
 import { KubitClient } from "./kubitClient";
 import { RedisLock } from "../../utils/RedisLock";
+import { env } from "../../env";
 import { z } from "zod/v4";
 
 // ── Token endpoint ──
@@ -428,7 +429,14 @@ export const handleKubitProjectJob = async (
     // retry picked up by Worker N+1, which would cascade throttling on Kinesis.
     const processors: Promise<void>[] = [];
 
-    // Scores always run regardless of exportSource
+    // When the V4 events pipeline is active, send enriched observations
+    // (denormalized, trace-context-embedded) instead of raw traces + observations.
+    // The pipeline is active when LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE=true,
+    // which is the deployment-level flag the admin sets when events_core is ready.
+    const useV4Pipeline =
+      env.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE === "true";
+
+    // Scores always run regardless of pipeline mode
     processors.push(
       runOrSkip(
         "scores",
@@ -444,11 +452,8 @@ export const handleKubitProjectJob = async (
       ),
     );
 
-    // Traces and legacy observations — TRACES_OBSERVATIONS or TRACES_OBSERVATIONS_EVENTS
-    if (
-      dbIntegration.exportSource === "TRACES_OBSERVATIONS" ||
-      dbIntegration.exportSource === "TRACES_OBSERVATIONS_EVENTS"
-    ) {
+    // Legacy mode: raw traces + observations (V4 pipeline not active)
+    if (!useV4Pipeline) {
       processors.push(
         runOrSkip(
           "traces",
@@ -477,11 +482,8 @@ export const handleKubitProjectJob = async (
       );
     }
 
-    // Enriched observations from the events table — EVENTS or TRACES_OBSERVATIONS_EVENTS
-    if (
-      dbIntegration.exportSource === "EVENTS" ||
-      dbIntegration.exportSource === "TRACES_OBSERVATIONS_EVENTS"
-    ) {
+    // V4 mode: enriched observations with denormalized trace context
+    if (useV4Pipeline) {
       processors.push(
         runOrSkip(
           "enriched observations",

@@ -61,7 +61,6 @@ Creates the `kubit_integrations` table in PostgreSQL. One row per project, keyed
 | `enabled` | BOOLEAN | Toggle sync on/off without deleting config |
 | `sync_interval_minutes` | INT (default 60) | How often to sync per project |
 | `request_timeout_seconds` | INT (default 30) | HTTP timeout per Kinesis batch request |
-| `export_source` | TEXT (default `TRACES_OBSERVATIONS`) | Which entity types to export |
 | `encrypted_aws_access_key_id` | TEXT nullable | Cached STS credential |
 | `encrypted_aws_secret_access_key` | TEXT nullable | Cached STS credential |
 | `encrypted_aws_session_token` | TEXT nullable | Cached STS credential |
@@ -121,7 +120,7 @@ Adds one async generator per entity type (`getTracesForKubit`, `getObservationsF
 ### `packages/shared/src/server/repositories/events.ts`
 **Modified — adds ClickHouse streaming query for V4 enriched observations**
 
-Adds `getEventsForKubit` — an async generator that streams V4 enriched observations from the events table. Used when `exportSource` is `EVENTS` or `TRACES_OBSERVATIONS_EVENTS`. These records denormalize trace-level fields (userId, sessionId, tags, etc.) directly into each observation row, providing a single enriched record per span.
+Adds `getEventsForKubit` — an async generator that streams V4 enriched observations from the events table. Used when `LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE=true`. These records denormalize trace-level fields (userId, sessionId, tags, etc.) directly into each observation row, providing a single enriched record per span.
 
 ---
 
@@ -200,13 +199,12 @@ The main job handler. Key behaviours:
 
 **Per-processor skip on retry** — After each processor completes, its `{entity}SyncedAt` column is written. On retry, processors whose `syncedAt >= maxTimestamp` are skipped, preventing duplicate sends.
 
-**Export source routing** — Which processors run depends on the `exportSource` setting:
+**Pipeline mode routing** — Which processors run is determined automatically by the `LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE` env var:
 
-| `exportSource` | Processors |
+| `LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE` | Processors |
 |---|---|
-| `TRACES_OBSERVATIONS` | traces, observations, scores |
-| `TRACES_OBSERVATIONS_EVENTS` | traces, observations, scores, enriched events |
-| `EVENTS` | enriched events, scores |
+| `false` (default) | traces, observations, scores |
+| `true` | enriched observations (V4), scores |
 
 **allSettled behaviour** — All processors run to completion via `Promise.allSettled` before any error is thrown. This prevents lingering processors from one job run overlapping with the next retry.
 
@@ -306,8 +304,8 @@ handleKubitProjectJob
     │   ├── getTracesForKubit(projectId, minTs, maxTs)        ← ClickHouse stream
     │   ├── getObservationsForKubit(projectId, minTs, maxTs)  ← ClickHouse stream
     │   ├── getScoresForKubit(projectId, minTs, maxTs)        ← ClickHouse stream
-    │   └── getEventsForKubit(projectId, minTs, maxTs)        ← ClickHouse stream
-    │         │ (which run depends on exportSource)
+    │   └── getEventsForKubit(projectId, minTs, maxTs)        ← ClickHouse stream (V4 mode only)
+    │         │ (legacy: traces+observations+scores / V4: enriched observations+scores)
     │         ▼
     │    KubitClient.addEvent(event)   — enriches with wid
     │    KubitClient.flush()           — called every 25 MB + end of stream
