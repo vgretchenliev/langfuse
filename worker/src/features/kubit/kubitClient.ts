@@ -126,6 +126,7 @@ export class KubitClient {
   private readonly streamName: string;
   private readonly projectId: string;
   private readonly workspaceId: string;
+  private readonly widClaim: string | undefined;
   private readonly requestTimeoutMs: number;
   private batch: KubitEvent[] = [];
   private batchBytes = 0;
@@ -138,6 +139,7 @@ export class KubitClient {
     streamName,
     projectId,
     workspaceId,
+    widClaim,
     requestTimeoutSeconds,
   }: {
     awsAccessKeyId: string;
@@ -147,6 +149,7 @@ export class KubitClient {
     streamName: string;
     projectId: string;
     workspaceId: string;
+    widClaim?: string;
     requestTimeoutSeconds: number;
   }) {
     this.awsAccessKeyId = awsAccessKeyId;
@@ -156,17 +159,19 @@ export class KubitClient {
     this.streamName = streamName;
     this.projectId = projectId;
     this.workspaceId = workspaceId;
+    this.widClaim = widClaim;
     this.requestTimeoutMs = requestTimeoutSeconds * 1000;
   }
 
   /** No-op — kept for API compatibility. Built-in fetch manages connections automatically. */
   public async destroy(): Promise<void> {}
 
-  /**
-   * Enrich the event with the workspace id
-   */
   public addEvent(event: KubitEvent): void {
-    const enriched: KubitEvent = { ...event, wid: this.workspaceId };
+    const enriched: KubitEvent = {
+      ...event,
+      wid: this.workspaceId,
+      ...(this.widClaim ? { _wid_claim: this.widClaim } : {}),
+    };
     const eventBytes = Buffer.byteLength(JSON.stringify(enriched), "utf8");
     this.batch.push(enriched);
     this.batchBytes += eventBytes;

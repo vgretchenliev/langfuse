@@ -9,6 +9,7 @@ CREATE TABLE "kubit_integrations" (
     "encrypted_aws_access_key_id" TEXT,
     "encrypted_aws_secret_access_key" TEXT,
     "encrypted_aws_session_token" TEXT,
+    "encrypted_wid_claim" TEXT,
     "aws_credentials_expiry" TIMESTAMP(3),
     "aws_kinesis_stream_name" TEXT,
     "aws_kinesis_region" TEXT,

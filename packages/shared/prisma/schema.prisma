@@ -1102,6 +1102,7 @@ model KubitIntegration {
   encryptedAwsAccessKeyId     String?   @map("encrypted_aws_access_key_id")
   encryptedAwsSecretAccessKey String?   @map("encrypted_aws_secret_access_key")
   encryptedAwsSessionToken    String?   @map("encrypted_aws_session_token")
+  encryptedWidClaim           String?   @map("encrypted_wid_claim")
   awsCredentialsExpiry        DateTime? @map("aws_credentials_expiry")
   awsKinesisStreamName        String?   @map("aws_kinesis_stream_name")
   awsKinesisRegion            String?   @map("aws_kinesis_region")

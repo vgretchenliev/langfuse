@@ -29,6 +29,7 @@ const tokenResponseSchema = z.object({
     stream_name: z.string(),
     region: z.string(),
     expiry: z.string(),
+    wid_claim: z.string().optional(),
   }),
 });
 
@@ -39,6 +40,7 @@ type AwsCredentials = {
   awsKinesisRegion: string;
   awsKinesisStreamName: string;
   awsKinesisPartitionKey: string;
+  widClaim?: string;
 };
 
 async function getOrRefreshAwsCredentials(params: {
@@ -48,6 +50,7 @@ async function getOrRefreshAwsCredentials(params: {
     encryptedAwsAccessKeyId: string | null;
     encryptedAwsSecretAccessKey: string | null;
     encryptedAwsSessionToken: string | null;
+    encryptedWidClaim: string | null;
     awsCredentialsExpiry: Date | null;
     awsKinesisStreamName: string | null;
     awsKinesisRegion: string | null;
@@ -76,6 +79,9 @@ async function getOrRefreshAwsCredentials(params: {
       awsKinesisRegion: dbIntegration.awsKinesisRegion!,
       awsKinesisStreamName: dbIntegration.awsKinesisStreamName!,
       awsKinesisPartitionKey: dbIntegration.awsKinesisPartitionKey!,
+      widClaim: dbIntegration.encryptedWidClaim
+        ? decrypt(dbIntegration.encryptedWidClaim)
+        : undefined,
     };
   }
 
@@ -124,6 +130,9 @@ async function getOrRefreshAwsCredentials(params: {
       encryptedAwsAccessKeyId: encrypt(parsed.credentials.AccessKeyId),
       encryptedAwsSecretAccessKey: encrypt(parsed.credentials.SecretAccessKey),
       encryptedAwsSessionToken: encrypt(parsed.credentials.SessionToken),
+      encryptedWidClaim: parsed.metadata.wid_claim
+        ? encrypt(parsed.metadata.wid_claim)
+        : null,
       awsCredentialsExpiry: new Date(parsed.metadata.expiry),
       awsKinesisStreamName: parsed.metadata.stream_name,
       awsKinesisRegion: parsed.metadata.region,
@@ -143,6 +152,7 @@ async function getOrRefreshAwsCredentials(params: {
     awsKinesisRegion: parsed.metadata.region,
     awsKinesisStreamName: parsed.metadata.stream_name,
     awsKinesisPartitionKey: parsed.metadata.partition_key,
+    widClaim: parsed.metadata.wid_claim,
   };
 }
 
@@ -159,6 +169,7 @@ type KubitConfig = {
   awsKinesisRegion: string;
   awsKinesisStreamName: string;
   awsKinesisPartitionKey: string;
+  widClaim?: string;
 };
 
 // ── Processors ──
@@ -178,6 +189,7 @@ const processKubitTraces = async (config: KubitConfig) => {
     streamName: config.awsKinesisStreamName,
     projectId: config.projectId,
     workspaceId: config.awsKinesisPartitionKey,
+    widClaim: config.widClaim,
     requestTimeoutSeconds: config.requestTimeoutSeconds,
   });
   let count = 0;
@@ -216,6 +228,7 @@ const processKubitObservations = async (config: KubitConfig) => {
     streamName: config.awsKinesisStreamName,
     projectId: config.projectId,
     workspaceId: config.awsKinesisPartitionKey,
+    widClaim: config.widClaim,
     requestTimeoutSeconds: config.requestTimeoutSeconds,
   });
   let count = 0;
@@ -256,6 +269,7 @@ const processKubitScores = async (config: KubitConfig) => {
     streamName: config.awsKinesisStreamName,
     projectId: config.projectId,
     workspaceId: config.awsKinesisPartitionKey,
+    widClaim: config.widClaim,
     requestTimeoutSeconds: config.requestTimeoutSeconds,
   });
   let count = 0;
@@ -294,6 +308,7 @@ const processKubitEvents = async (config: KubitConfig) => {
     streamName: config.awsKinesisStreamName,
     projectId: config.projectId,
     workspaceId: config.awsKinesisPartitionKey,
+    widClaim: config.widClaim,
     requestTimeoutSeconds: config.requestTimeoutSeconds,
   });
   let count = 0;
